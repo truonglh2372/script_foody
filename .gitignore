@@ -1,0 +1,6 @@
+foody_data/
+.venv/
+__pycache__/
+*.pyc
+creds.env
+*.log
