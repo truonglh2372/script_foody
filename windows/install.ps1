@@ -26,9 +26,9 @@ $V = "$Root\.venv\Scripts\python.exe"
 & $V -m pip install -q -r requirements.txt
 if ($env:AQD_FOODY_CLIP -eq '1') { & $V -m pip install -q -r requirements-clip.txt }
 Remove-Item "$Root\foody_data\STOP" -Force -ErrorAction SilentlyContinue
-if ($env:AQD_FOODY_NORUN -eq '1') { "Đã cài ở $Root"; return }
-$a = @('-u', "$Root\common\foody_fetch.py", '--limit', $Limit)
+if ($env:AQD_FOODY_NORUN -eq '1') { "Da cai o $Root"; return }
+$env:PYTHONUTF8 = "1"; $a = @("-u", "$Root\common\foody_fetch.py", '--limit', $Limit)
 if ($env:AQD_FOODY_CLIP -ne '1') { $a += '--no-clip' }
 $p = Start-Process -FilePath $V -ArgumentList $a -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
   -RedirectStandardOutput "$Root\foody_data\fetch.log" -RedirectStandardError "$Root\foody_data\fetch.err.log"
-"Đang chạy (pid $($p.Id)). Log: $Root\foody_data\fetch.log | Dừng: New-Item $Root\foody_data\STOP"
+"Dang chay (pid $($p.Id)). Log: $Root\foody_data\fetch.log | Dung: New-Item $Root\foody_data\STOP"

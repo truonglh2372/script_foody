@@ -16,6 +16,11 @@ Kết quả: foody_data/<foody_id>/place.json + photos/*.jpg ; tiến độ food
 """
 from __future__ import annotations
 import argparse, html, json, os, random, re, sys, time, urllib.parse
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from datetime import datetime, timezone
 import requests
 
@@ -236,6 +241,14 @@ def download(c, items, folder):
                 f.write(r.content)
 
 
+def _review_id(x):
+    rid = x.get("Id") or x.get("ReviewId") or x.get("reviewId")
+    if not rid:
+        m = re.search(r"(\d+)(?:\D*)$", x.get("reviewUrl") or "")
+        rid = m.group(1) if m else None
+    return str(rid) if rid else None
+
+
 def fetch_place(c, item, args):
     fid, url = item["Id"], item["Url"]
     ref = BASE + url
@@ -259,8 +272,11 @@ def fetch_place(c, item, args):
         "review_count": det.get("review_count") or item.get("TotalReviews"),
         "opening_hours": days, "opening_periods": periods,
         "menu": mn,
-        "reviews_sample": [{"rating": x.get("AvgRating"), "text": x.get("Comment"),
-                            "author": x.get("reviewUserDisplayName"), "source_url": BASE + (x.get("reviewUrl") or "")}
+        # Mọi review Foody gắn source='foody' + source_id để xoá hàng loạt (issue #682)
+        "reviews_sample": [{"source": "foody", "source_id": _review_id(x), "imported_from": "foody",
+                            "rating": x.get("AvgRating"), "text": x.get("Comment"),
+                            "author": x.get("reviewUserDisplayName"), "created_at": x.get("CreatedOn"),
+                            "source_url": BASE + (x.get("reviewUrl") or "")}
                            for x in item.get("LstReview") or []],
         "photos": [{**p, "source": "foody", "source_id": str(p.get("foody_photo_id")),
                     "source_url": p["url"]} for p in ph],

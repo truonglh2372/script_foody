@@ -5,6 +5,11 @@
   python tools/foody_delete.py --local       # xoá thư mục foody_data/ trên máy này
 """
 import argparse, os, shutil, sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "common"))
 ROOT = os.environ.get("AQD_FOODY_DATA", os.path.join(HERE, "..", "foody_data"))
 EP = "/api/v1/admin/imports/foody"

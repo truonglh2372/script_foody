@@ -9,6 +9,11 @@ Mọi quán/ảnh/món gửi lên đều mang source='foody', source_id, source_
   python common/foody_upload.py --apply --ids 30086 44253
 """
 import argparse, json, os, sys, uuid
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 ROOT = os.environ.get("AQD_FOODY_DATA", os.path.join(HERE, "..", "foody_data"))
 EP = os.environ.get("AQD_FOODY_IMPORT_EP", "/api/v1/admin/imports/restaurants")
@@ -31,6 +36,19 @@ def payload(p):
     }
 
 
+def reviews_of(p):
+    """Review Foody: luôn mang source='foody' + source_id. CHƯA gửi lên API (chờ #682),
+    chỉ ghi vào foody_data/_reviews_pending.jsonl ở trạng thái pending_api."""
+    out = []
+    for x in p.get("reviews_sample") or []:
+        if not x.get("source_id"):
+            continue  # không có id nguồn thì không bao giờ gửi (không xoá được)
+        out.append({"source": "foody", "source_id": x["source_id"], "source_url": x.get("source_url"),
+                    "author_name": x.get("author"), "rating": x.get("rating"), "text": x.get("text"),
+                    "restaurant_source_id": p["source_id"], "status": "pending_api"})
+    return out
+
+
 def photos_of(p):
     return [x for x in p.get("photos") or [] if x.get("keep") and x.get("file")]
 
@@ -49,11 +67,16 @@ def main():
         if isinstance(probe, dict) and probe.get("_status") == 404:
             sys.exit(f"Endpoint {EP} chưa có trên server (chờ issue #683). Không gửi gì.")
     prev = open(os.path.join(ROOT, "_upload_preview.jsonl"), "w", encoding="utf-8")
+    revf = open(os.path.join(ROOT, "_reviews_pending.jsonl"), "w", encoding="utf-8")
     n = 0
     for fid in ids:
         p = json.load(open(os.path.join(ROOT, fid, "place.json"), encoding="utf-8"))
         body, ph = payload(p), photos_of(p)
-        prev.write(json.dumps({**body, "photos": [x["source_id"] for x in ph]}, ensure_ascii=False) + "\n")
+        rv = reviews_of(p)
+        for r_ in rv:
+            revf.write(json.dumps(r_, ensure_ascii=False) + "\n")
+        prev.write(json.dumps({**body, "photos": [x["source_id"] for x in ph],
+                               "reviews_pending": [r_["source_id"] for r_ in rv]}, ensure_ascii=False) + "\n")
         if not a.apply:
             print(f"[dry] #{fid} {body['name']} | {len(body['opening_periods'])} ca | {len(body['menu'])} món | {len(ph)} ảnh")
             continue
