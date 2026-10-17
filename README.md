@@ -1,7 +1,7 @@
 # script_foody — lấy dữ liệu quán từ Foody (CHỈ ĐỂ TEST, sẽ xoá sau)
 
 > Dữ liệu và ảnh Foody chỉ dùng để thử nghiệm nội bộ. Ảnh được tải **nguyên bản**:
-> script **không** cắt, che hay xoá watermark Foody. Mọi bản ghi đều gắn `source=foody` để xoá hàng loạt.
+> script **không** cắt, che hay xoá watermark Foody. Mọi bản ghi đều gắn `source=foody` để lọc trên tab admin «Nguồn Foody» (#686).
 
 ## Cài + chạy bằng 1 lệnh
 **Mac**, dán vào Terminal:
@@ -45,11 +45,6 @@ Lịch sự với Foody: ≥2 s/request + ngẫu nhiên, gặp 429/403/“System
 .venv/bin/python common/foody_upload.py            # chỉ xem trước, ghi foody_data/_upload_preview.jsonl
 .venv/bin/python common/foody_upload.py --apply    # gửi thật
 ```
-Chỉ dùng endpoint import mới: truonglh2372/an_uong_quanh_day#683 (chống trùng + cờ `duplicate` trỏ tới quán bị trùng) và #682 (cột nguồn + xoá theo nguồn). Endpoint chưa có thì `--apply` dừng, không gửi gì. Đăng nhập admin dùng `common/aqd_api.py` như script_google_map (`creds.env` / `.aqd_session`, không commit).
+Chỉ dùng endpoint import mới: truonglh2372/an_uong_quanh_day#683 (chống trùng + cờ `duplicate` trỏ tới quán bị trùng) và #682 (cột nguồn). Xem quán Foody trên tab admin «Nguồn Foody» (#686). Endpoint chưa có thì `--apply` dừng, không gửi gì. Đăng nhập admin dùng `common/aqd_api.py` như script_google_map (`creds.env` / `.aqd_session`, không commit).
 
-## Xoá dữ liệu Foody
-```bash
-.venv/bin/python tools/foody_delete.py          # dry-run: server trả số quán/ảnh/món sẽ xoá
-.venv/bin/python tools/foody_delete.py --yes    # xoá thật trên server (#682)
-.venv/bin/python tools/foody_delete.py --local  # xoá foody_data/ trên máy
-```
+Dữ liệu Foody xoá thủ công từ tab admin «Nguồn Foody» (truonglh2372/an_uong_quanh_day#686).

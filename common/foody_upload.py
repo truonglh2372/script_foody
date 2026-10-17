@@ -2,7 +2,7 @@
 
 Chỉ dùng endpoint import mới (issue an_uong_quanh_day#683, cột nguồn ở #682).
 Khi endpoint chưa có (404) script dừng, KHÔNG ghi qua endpoint cũ.
-Mọi quán/ảnh/món gửi lên đều mang source='foody', source_id, source_url để xoá hàng loạt sau.
+Mọi quán/ảnh/món gửi lên đều mang source='foody', source_id, source_url để lọc trên tab admin Nguồn Foody (#686).
 
   python common/foody_upload.py                 # dry-run: in payload tóm tắt, ghi foody_data/_upload_preview.jsonl
   python common/foody_upload.py --apply         # gửi thật (cần endpoint #683)
