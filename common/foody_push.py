@@ -186,7 +186,7 @@ class Pusher:
                     continue
                 if fid == "__STOP__":
                     break
-                if self.handle(fid):
+                if self.handle(fid) and self.done.get(fid):
                     rec = self.done.get(fid) or {}
                     print(f"  [push ✓] #{fid} -> quán {rec.get('restaurant_id')} | {len(rec.get('photos') or [])} ảnh"
                           f"{' | đã xoá ảnh local' if fid in self.cleaned else ' | giữ ảnh (chờ server)'}", flush=True)
