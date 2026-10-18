@@ -293,12 +293,16 @@ def main(argv=None):
     ap.add_argument("--no-photos", action="store_true")
     ap.add_argument("--no-clip", action="store_true")
     ap.add_argument("--refetch", action="store_true")
+    ap.add_argument("--parity", choices=["odd", "even", "all"],
+                    default=os.environ.get("AQD_FOODY_PARITY", "all") or "all",
+                    help="chia việc 2 máy theo Foody id: odd (Mac) / even (Admin)")
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
     stp = os.path.join(ROOT, "_state.json")
     st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
     page = a.start_page or st.get("page", 1)
     c, n = Client(), 0
+    print(f"parity={a.parity}", flush=True)
     while a.limit == 0 or n < a.limit:
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng"); break
@@ -310,6 +314,8 @@ def main(argv=None):
             if a.limit and n >= a.limit:
                 break
             fid = str(it["Id"])
+            if a.parity != "all" and (int(fid) % 2 == 1) != (a.parity == "odd"):
+                continue
             if fid in st["done"] and not a.refetch:
                 continue
             try:
