@@ -293,19 +293,35 @@ def main(argv=None):
     ap.add_argument("--no-photos", action="store_true")
     ap.add_argument("--no-clip", action="store_true")
     ap.add_argument("--refetch", action="store_true")
+    ap.add_argument("--no-push", action="store_true", help="không đẩy lên server (chỉ cào)")
+    ap.add_argument("--min-free-gb", type=float, default=float(os.environ.get("AQD_FOODY_MIN_FREE_GB", "3")),
+                    help="ổ trống dưới mức này thì tạm ngừng cào, chờ uploader xoá ảnh")
     ap.add_argument("--parity", choices=["odd", "even", "all"],
                     default=os.environ.get("AQD_FOODY_PARITY", "all") or "all",
                     help="chia việc 2 máy theo Foody id: odd (Mac) / even (Admin)")
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
     stp = os.path.join(ROOT, "_state.json")
-    st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
+    try:
+        st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
+    except Exception as e:
+        print(f"[warn] _state.json hỏng ({e}) -> dùng bản .bak nếu có", flush=True)
+        st = json.load(open(stp + ".bak", encoding="utf-8")) if os.path.exists(stp + ".bak") else {"page": 1, "done": {}, "failed": {}}
+    pusher = None
+    if not a.no_push:
+        from foody_push import Pusher, free_gb
+        pusher = Pusher().start()
     page = a.start_page or st.get("page", 1)
     c, n = Client(), 0
     print(f"parity={a.parity}", flush=True)
     while a.limit == 0 or n < a.limit:
         if os.path.exists(os.path.join(ROOT, "STOP")):
-            print("thấy file STOP -> dừng"); break
+            print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
+            if pusher: pusher.drain_and_stop(); pusher.t.join()
+            break
+        if pusher and free_gb() < a.min_free_gb:
+            print(f"ổ còn {free_gb():.1f} GB < {a.min_free_gb} GB -> tạm ngừng cào 5 phút, uploader đang xoá ảnh đã lên", flush=True)
+            time.sleep(300); continue
         items, total = list_page(c, page)
         print(f"trang {page}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
@@ -327,16 +343,25 @@ def main(argv=None):
                     os.replace(tmp, os.path.join(d, "place.json"))
                     k = sum(1 for p in rec["photos"] if p.get("keep"))
                     print(f"  ✓ #{fid} {rec['name']} | {len(rec['opening_periods'])} ca | {len(rec['menu'])} món | ảnh {k}/{len(rec['photos'])}", flush=True)
+                    if pusher:
+                        pusher.append_reviews(fid, rec); pusher.q.put(fid)
                 st["done"][fid] = now(); n += 1
             except Exception as e:
                 st["failed"][fid] = st["failed"].get(fid, 0) + 1
                 print(f"  ✗ #{fid}: {e}", flush=True)
                 if st["failed"][fid] >= 3:
                     st["done"][fid] = "skip-3-fails"
-            json.dump(st, open(stp, "w", encoding="utf-8"))
+            _save_state(st, stp)
         page += 1; st["page"] = page
-        json.dump(st, open(stp, "w", encoding="utf-8"))
+        _save_state(st, stp)
     print(f"xong: {n} quán")
+
+
+def _save_state(st, stp):
+    if os.path.exists(stp):
+        try: os.replace(stp, stp + ".bak")
+        except OSError: pass
+    tmp = stp + ".tmp"; json.dump(st, open(tmp, "w", encoding="utf-8")); os.replace(tmp, stp)
 
 
 if __name__ == "__main__":

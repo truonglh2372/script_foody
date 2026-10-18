@@ -95,16 +95,23 @@ def main():
     a = ap.parse_args()
     ids = a.ids or sorted(d for d in os.listdir(ROOT) if os.path.exists(os.path.join(ROOT, d, "place.json")))
     log = os.path.join(ROOT, "_uploaded.json")
-    done = json.load(open(log, encoding="utf-8")) if os.path.exists(log) else {}
+    try:
+        done = json.load(open(log, encoding="utf-8")) if os.path.exists(log) else {}
+    except Exception:
+        print("[warn] _uploaded.json hỏng -> bắt đầu lại (server tự chống trùng theo source_id)"); done = {}
     api = APIError = None
     if a.apply:
+        from foody_push import load_creds; load_creds()
         from aqd_api import AQD, APIError
         api = AQD()
     prev = open(os.path.join(ROOT, "_upload_preview.jsonl"), "w", encoding="utf-8")
     revf = open(os.path.join(ROOT, "_reviews_pending.jsonl"), "w", encoding="utf-8")
     st = {"places": 0, "ok": 0, "bad": 0, "photos": 0, "reviews_pending": 0, "dup": 0, "existing": 0, "fail": 0}
     for fid in ids:
-        p = json.load(open(os.path.join(ROOT, fid, "place.json"), encoding="utf-8"))
+        try:
+            p = json.load(open(os.path.join(ROOT, fid, "place.json"), encoding="utf-8"))
+        except Exception as e:
+            print(f"[skip-json] #{fid} {e}"); continue
         body, ph, rv = payload(p), photos_of(p), reviews_of(p)
         st["places"] += 1; st["photos"] += len(ph); st["reviews_pending"] += len(rv)
         for r_ in rv:
