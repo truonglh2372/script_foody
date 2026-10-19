@@ -40,6 +40,42 @@ def _price(v):
     return n if n > 0 else None
 
 
+def _mins(t):
+    h, m = str(t).split(":")[:2]
+    return int(h) * 60 + int(m)
+
+
+def clean_periods(per):
+    """Foody hay có ca trùng/lồng nhau hoặc ca 0 phút (00:00-00:00) -> server trả 422 opening_periods_invalid.
+    Bỏ ca 0 phút, gộp các ca chồng nhau trong cùng ngày (ca qua đêm: closes < opens tính +24h)."""
+    out = []
+    for wd in range(1, 8):
+        iv = []
+        for x in per:
+            if x["weekday"] != wd or not x.get("closes_at"):
+                continue
+            try:
+                a, b = _mins(x["opens_at"]), _mins(x["closes_at"])
+            except (ValueError, TypeError):
+                continue
+            if a == b:
+                continue
+            if b < a:
+                b += 1440
+            iv.append([a, b])
+        iv.sort(); merged = []
+        for a, b in iv:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for a, b in merged:
+            b = min(b, a + 1439)
+            out.append({"weekday": wd, "opens_at": f"{a // 60:02d}:{a % 60:02d}",
+                        "closes_at": f"{(b // 60) % 24:02d}:{b % 60:02d}"})
+    return out
+
+
 def payload(p):
     menu = []
     for m in p.get("menu") or []:
@@ -51,6 +87,7 @@ def payload(p):
                      "kind": "drink" if any(h in txt for h in DRINK_HINT) else "food"})
     per = [x for x in p.get("opening_periods") or []
            if isinstance(x.get("weekday"), int) and 1 <= x["weekday"] <= 7 and x.get("opens_at")]
+    per = clean_periods(per)
     body = {"source": "foody", "source_id": str(p["source_id"]), "source_url": p.get("source_url"),
             "name": p.get("name"), "address": p.get("address_full") or p.get("address"),
             "district": p.get("district"), "city": p.get("city"), "lat": p.get("lat"), "lng": p.get("lng"),
