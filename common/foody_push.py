@@ -36,6 +36,7 @@ import foody_upload as fu  # noqa: E402
 
 ROOT = fu.ROOT; EP = fu.EP
 UP = os.path.join(ROOT, "_uploaded.json"); CL = os.path.join(ROOT, "_cleaned.json")
+RP = os.path.join(ROOT, "_reviews_pushed.json")  # fid -> [review source_id đã lên server]
 REV = os.path.join(ROOT, "_reviews_pending.jsonl")
 _lock = threading.Lock()
 
@@ -70,12 +71,12 @@ class Pusher:
         load_creds()
         from aqd_api import AQD
         self.api = AQD()
-        self.done = _read(UP, {}); self.cleaned = _read(CL, {})
-        self.q = queue.Queue(); self.stats = {"pushed": 0, "photos": 0, "deleted_files": 0, "freed_bytes": 0, "fail": 0}
+        self.done = _read(UP, {}); self.cleaned = _read(CL, {}); self.rpushed = _read(RP, {})
+        self.q = queue.Queue(); self.stats = {"reviews": 0, "pushed": 0, "photos": 0, "deleted_files": 0, "freed_bytes": 0, "fail": 0}
 
     def _save(self):
         with _lock:
-            _write(UP, self.done); _write(CL, self.cleaned)
+            _write(UP, self.done); _write(CL, self.cleaned); _write(RP, self.rpushed)
 
     def append_reviews(self, fid, p):
         seen = set()
@@ -150,10 +151,49 @@ class Pusher:
         self.cleaned[fid] = rec["restaurant_id"]; self._save()
         return True
 
+    @staticmethod
+    def review_rows(p):
+        """Review Foody -> body cho POST /v1/admin/imports/restaurants/:id/reviews (#736). rating_original thang 0-10."""
+        rows = []
+        for r in fu.reviews_of(p):
+            try:
+                ro = float(r.get("rating"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= ro <= 10:
+                continue
+            row = {"source": "foody", "source_id": r["source_id"], "source_url": r.get("source_url"),
+                   "author_name": r.get("author_name"), "rating_original": ro, "text": r.get("text") or ""}
+            rows.append({k: v for k, v in row.items() if v is not None})
+        return rows
+
+    def push_reviews(self, fid, p=None):
+        """Đẩy review của quán đã import; idempotent (server upsert theo source+source_id, local _reviews_pushed.json)."""
+        rec = self.done.get(fid) or {}
+        if not rec.get("restaurant_id"):
+            return False
+        p = p or load_place(fid)
+        if p is None:
+            return False
+        sent = set(self.rpushed.get(fid) or [])
+        todo = [r for r in self.review_rows(p) if r["source_id"] not in sent]
+        for i in range(0, len(todo), 20):
+            chunk = todo[i:i + 20]
+            self.api.call("POST", f"{EP}/{rec['restaurant_id']}/reviews", json_body={"reviews": chunk}, timeout=90)
+            self.rpushed.setdefault(fid, []).extend(r["source_id"] for r in chunk)
+            self.stats["reviews"] += len(chunk); self._save()
+        self.rpushed.setdefault(fid, [])
+        return True
+
+    def reviews_pending(self, fid):
+        return fid not in self.rpushed
+
     def handle(self, fid):
         try:
             if self.push(fid):
                 self.cleanup(fid)
+            if self.reviews_pending(fid):
+                self.push_reviews(fid)
             return True
         except Exception as e:
             self.stats["fail"] += 1
@@ -161,7 +201,8 @@ class Pusher:
             return False
 
     def backlog(self):
-        ids = sorted(d for d in os.listdir(ROOT) if d not in self.cleaned and os.path.exists(os.path.join(ROOT, d, "place.json")))
+        ids = sorted(d for d in os.listdir(ROOT) if (d not in self.cleaned or (d in self.done and self.reviews_pending(d)))
+                     and os.path.exists(os.path.join(ROOT, d, "place.json")))
         return ids
 
     # ---- worker thread: hàng đợi quán mới trước, rảnh thì quét backlog ----
