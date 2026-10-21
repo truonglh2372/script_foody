@@ -121,9 +121,15 @@ class Pusher:
             rec.setdefault("photos", []).append(x["source_id"]); self.stats["photos"] += 1; self._save()
         return missing_file == 0
 
+    @staticmethod
+    def has_photo_files(fid):
+        pd = os.path.join(ROOT, fid, "photos")
+        return os.path.isdir(pd) and any(os.path.isfile(os.path.join(pd, f)) for f in os.listdir(pd))
+
     def cleanup(self, fid):
-        """Xoá ảnh local khi server đã lưu đủ. True nếu đã xoá (hoặc không còn gì để xoá)."""
-        if fid in self.cleaned:
+        """Xoá ảnh local khi server đã lưu đủ. True nếu đã xoá (hoặc không còn gì để xoá).
+        Quán đã 'cleaned' mà lại có file ảnh (bị cào lại) thì kiểm lại với server rồi mới xoá."""
+        if fid in self.cleaned and not self.has_photo_files(fid):
             return True
         rec = self.done.get(fid); p = load_place(fid)
         if not rec or p is None:
@@ -201,7 +207,8 @@ class Pusher:
             return False
 
     def backlog(self):
-        ids = sorted(d for d in os.listdir(ROOT) if (d not in self.cleaned or (d in self.done and self.reviews_pending(d)))
+        ids = sorted(d for d in os.listdir(ROOT) if (d not in self.cleaned or (d in self.done and self.reviews_pending(d))
+                                                     or self.has_photo_files(d))
                      and os.path.exists(os.path.join(ROOT, d, "place.json")))
         return ids
 
