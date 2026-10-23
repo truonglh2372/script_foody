@@ -202,27 +202,11 @@ def photos(c, fid, ref, max_n):
     return out[:max_n]
 
 
-def filter_photos(items, use_clip=True):
-    """Luật ảnh như script_google_map: chỉ giữ food/drink/menu/venue/signboard.
-    Album 'Món ăn' và 'Thực đơn' vẫn qua CLIP để loại selfie, hoá đơn...; 'Tổng hợp' bắt buộc qua CLIP."""
-    try:
-        import photo_filter as pf
-        ok = use_clip and pf.available()
-    except Exception:
-        pf, ok = None, False
+def filter_photos(items):
+    """#855: no local model. Keep every photo of the Thực đơn / Món ăn / Không gian albums; the API classifies
+    each upload. 'Tổng hợp' (album other) has no import role the API accepts yet, so it stays local only."""
     for it in items:
-        if not ok:
-            it["keep"] = it["album"] != "other"; it["clip"] = None; continue
-        try:
-            r = pf.classify_url(it["url"] + "@resize_ss640x640")
-        except Exception as e:
-            r = {"error": str(e)}
-        it["clip"] = r
-        lab = r.get("label") if isinstance(r, dict) else None
-        it["keep"] = bool(r.get("keep")) if isinstance(r, dict) and "keep" in r else (
-            lab in pf.ALLOWED if lab else it["album"] != "other")
-        if lab:
-            it["role"] = lab
+        it["keep"] = it["album"] != "other"
     return items
 
 
@@ -261,7 +245,7 @@ def fetch_place(c, item, args):
     mn = menu(c, fid, url)
     ph = photos(c, fid, url, args.max_photos) if not args.no_photos else []
     if ph:
-        filter_photos(ph, use_clip=not args.no_clip)
+        filter_photos(ph)
         download(c, ph, os.path.join(ROOT, str(fid), "photos"))
     rec = {
         "source": "foody", "source_id": str(fid), "source_url": ref, "fetched_at": now(),
@@ -291,7 +275,7 @@ def main(argv=None):
     ap.add_argument("--start-page", type=int, default=None)
     ap.add_argument("--max-photos", type=int, default=int(os.environ.get("AQD_FOODY_MAX_PHOTOS", "30")))
     ap.add_argument("--no-photos", action="store_true")
-    ap.add_argument("--no-clip", action="store_true")
+    ap.add_argument("--no-clip", action="store_true", help="bỏ (#855): không còn CLIP local, giữ để lệnh cũ không lỗi")
     ap.add_argument("--refetch", action="store_true")
     ap.add_argument("--no-push", action="store_true", help="không đẩy lên server (chỉ cào)")
     ap.add_argument("--min-free-gb", type=float, default=float(os.environ.get("AQD_FOODY_MIN_FREE_GB", "3")),

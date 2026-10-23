@@ -18,7 +18,6 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 | Biến | Ý nghĩa | Mặc định |
 |---|---|---|
 | `AQD_FOODY_LIMIT` | số quán lấy mỗi lần chạy, `0` = chạy hết (hết danh sách thì nghỉ 10 phút rồi quét lại) | `20` |
-| `AQD_FOODY_CLIP` | `1` = cài CLIP và lọc ảnh như script_google_map | tắt |
 | `AQD_FOODY_DELAY` | giây giữa 2 request tới Foody | `2` |
 | `AQD_FOODY_MAX_PHOTOS` | ảnh tối đa / quán | `30` |
 | `AQD_FOODY_ROOT` | thư mục cài | `~/script_foody`, `C:\script_foody` |
@@ -36,7 +35,7 @@ Mỗi quán → `foody_data/<foody_id>/place.json`:
 - menu công khai (trang `/thuc-don`, nếu quán có)
 - ảnh: album Thực đơn → Món ăn → Không gian → Tổng hợp; mỗi ảnh có `source_id` (id ảnh Foody), `source_url`, `album`, `keep`. Ảnh `keep` lưu ở `photos/`.
 
-Luật ảnh: chỉ giữ món ăn, đồ uống, menu, không gian, bảng hiệu (`common/photo_filter.py` lấy từ script_google_map). Không cài CLIP thì album “Tổng hợp” bị bỏ.
+Luật ảnh (#855): **không còn model local**. Mọi ảnh của album Thực đơn / Món ăn / Không gian được upload, API tự phân loại (ảnh khó → `unclassified` cho admin; chỉ ảnh menu đi vào flow đọc menu). Album “Tổng hợp” chưa upload vì API import chưa nhận ảnh không có `role`.
 
 Lịch sự với Foody: ≥2 s/request + ngẫu nhiên, gặp 429/403/“System Busy” thì chờ 30 s → 10 phút; lỗi 3 lần thì bỏ quán.
 

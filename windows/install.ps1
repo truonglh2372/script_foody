@@ -1,7 +1,7 @@
 # Cài + chạy script_foody bằng 1 lệnh (Windows PowerShell):
 #   irm https://raw.githubusercontent.com/truonglh2372/script_foody/main/windows/install.ps1 | iex
 # Biến tuỳ chọn: $env:AQD_FOODY_ROOT (mặc định C:\script_foody), $env:AQD_FOODY_LIMIT (20; 0 = chạy hết),
-#   $env:AQD_FOODY_PARITY (mac dinh even; odd/all), $env:AQD_FOODY_CLIP=1 (cài CLIP lọc ảnh), $env:AQD_FOODY_NORUN=1 (chỉ cài)
+#   $env:AQD_FOODY_PARITY (mac dinh even; odd/all), $env:AQD_FOODY_NORUN=1 (chỉ cài)
 $ErrorActionPreference = 'Stop'
 $Root = if ($env:AQD_FOODY_ROOT) { $env:AQD_FOODY_ROOT } else { 'C:\script_foody' }
 $Limit = if ($env:AQD_FOODY_LIMIT) { $env:AQD_FOODY_LIMIT } else { '20' }
@@ -25,11 +25,10 @@ if (-not (Test-Path .venv)) { & $PyExe @PyArgs -m venv .venv }
 $V = "$Root\.venv\Scripts\python.exe"
 & $V -m pip install -q --upgrade pip
 & $V -m pip install -q -r requirements.txt
-if ($env:AQD_FOODY_CLIP -eq '1') { & $V -m pip install -q -r requirements-clip.txt }
 Remove-Item "$Root\foody_data\STOP" -Force -ErrorAction SilentlyContinue
 if ($env:AQD_FOODY_NORUN -eq '1') { "Da cai o $Root"; return }
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
-$clip = if ($env:AQD_FOODY_CLIP -ne '1') { '--no-clip' } else { '' }
+# #855: khong con model local - API phan loai moi anh
 if ($Limit -eq '0') {
   # chay het: autostart qua Startup folder (.cmd), giong script Google
   $Startup = [Environment]::GetFolderPath('Startup')
@@ -39,13 +38,13 @@ if ($Limit -eq '0') {
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 cd /d "$Root"
-start "" /min cmd /c ""$V" -u "$Root\common\foody_fetch.py" --limit 0 --parity $Parity $clip >> "$Root\foody_data\fetch.log" 2>&1"
+start "" /min cmd /c ""$V" -u "$Root\common\foody_fetch.py" --limit 0 --parity $Parity >> "$Root\foody_data\fetch.log" 2>&1"
 "@ | Set-Content -Path $Cmd -Encoding ASCII
+  Remove-Item (Join-Path $Startup 'aqd_foody.cmd.disabled') -Force -ErrorAction SilentlyContinue
   Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$Cmd`"" -WindowStyle Hidden
   "Dang chay nen (parity $Parity, autostart: $Cmd). Log: $Root\foody_data\fetch.log | Dung: New-Item $Root\foody_data\STOP"
 } else {
   $a = @("-u", "$Root\common\foody_fetch.py", '--limit', $Limit, '--parity', $Parity)
-  if ($clip) { $a += $clip }
   $p = Start-Process -FilePath $V -ArgumentList $a -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput "$Root\foody_data\fetch.log" -RedirectStandardError "$Root\foody_data\fetch.err.log"
   "Dang chay (pid $($p.Id), parity $Parity). Log: $Root\foody_data\fetch.log | Dung: New-Item $Root\foody_data\STOP"
