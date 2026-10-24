@@ -32,6 +32,20 @@ Dừng: tạo file `foody_data/STOP`. Log: `foody_data/fetch.log`.
 - Tối đa 1 lần mỗi `AQD_HEARTBEAT_EVERY_MIN` phút (mặc định 15); gửi ngay khi dừng hoặc ổ đầy. Số đếm cộng dồn ở `foody_data/heartbeat_state.json`; gửi lỗi thì gửi lại đúng body + `Idempotency-Key` cũ. Lỗi heartbeat không bao giờ làm dừng việc cào. `AQD_HEARTBEAT=0` để tắt.
 - Test offline: `python3 tests/test_heartbeat.py`.
 
+## Gọi thẳng server gốc, bỏ qua Cloudflare (an_uong_quanh_day#1058)
+Đường Viettel → Cloudflare SG hay mất gói nên gọi API qua Cloudflare chậm. Thêm **một dòng** vào `creds.env` (hoặc biến môi trường) để gọi thẳng server gốc:
+
+```
+AQD_ORIGIN_IP=<IP server gốc, chủ dự án đưa>
+```
+
+- Giống `curl --resolve`: chỉ việc tra DNS của host trong `AQD_BASE` được thay bằng IP đó. URL, SNI, header `Host` và việc kiểm tra chứng chỉ vẫn dùng tên `anuongquanhday.com`, nên chứng chỉ phải khớp tên (server gốc có sẵn chứng chỉ Let's Encrypt cho tên này). **Không bao giờ tắt kiểm tra TLS**; token / đăng nhập admin không đổi.
+- Chỉ pin đúng host của `AQD_BASE`; Google, Foody, CDN ảnh... vẫn tra DNS bình thường.
+- `AQD_BASE` phải là `https://...` và `AQD_ORIGIN_IP` phải là đúng một địa chỉ IP, không thì client admin báo lỗi ngay (`OriginPinError`) còn heartbeat tự tắt. Để trống / không có dòng này = như cũ (qua Cloudflare).
+- **Bỏ:** xoá dòng đó rồi khởi động lại crawler. Chạy lại installer và chọn ghi đè `creds.env` sẽ mất dòng này (khi đó crawler lại đi qua Cloudflare, vẫn chạy được); thêm lại sau khi cài.
+- Kiểm tra trên máy: `curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --resolve anuongquanhday.com:443:<IP> https://anuongquanhday.com/up` phải ra `200`.
+- Test offline: `python3 tests/test_origin_pin.py` (server TLS thật ở 127.0.0.1 với CA tạm; phần `requests` cần `pip install -r requirements.txt`).
+
 ## Lấy những gì
 Nguồn: danh sách `https://www.foody.vn/ho-chi-minh/o-dau` (JSON công khai trang này dùng), không đăng nhập, không vượt captcha.
 Mỗi quán → `foody_data/<foody_id>/place.json`:
