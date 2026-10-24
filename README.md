@@ -24,6 +24,13 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 
 Dừng: tạo file `foody_data/STOP`. Log: `foody_data/fetch.log`.
 
+## Heartbeat cho báo cáo Slack hằng ngày (an_uong_quanh_day#1021)
+`common/heartbeat.py` gửi `POST {AQD_BASE}/v1/ingest/heartbeats` để báo cáo Slack 08:00 biết máy này còn cào, đã lấy bao nhiêu quán / ảnh / món và có bị Foody chặn không.
+- **Bật:** đặt `AQD_INGEST_TOKEN` trong môi trường hoặc thêm dòng `AQD_INGEST_TOKEN=<token>` vào `<AQD_ROOT>/creds.env` (cùng file chứa tài khoản admin). Token lấy ở Admin → Ingest clients (`/admin/ingest_clients`), mỗi máy một token, không bao giờ được in ra log. Không có token thì heartbeat không làm gì.
+- **Gửi gì:** `script_foody`, tên máy (`CRAWLER_HOSTNAME` hoặc hostname), trang đang cào, số quán / ảnh giữ lại / món menu / lỗi **kể từ heartbeat trước**, chỗ trống ổ đĩa, và vấn đề (`rate_limited` khi Foody trả 429/403/503 hoặc «System Busy», `disk_full` khi ổ dưới ngưỡng).
+- Tối đa 1 lần mỗi `AQD_HEARTBEAT_EVERY_MIN` phút (mặc định 15); gửi ngay khi dừng hoặc ổ đầy. Số đếm cộng dồn ở `foody_data/heartbeat_state.json`; gửi lỗi thì gửi lại đúng body + `Idempotency-Key` cũ. Lỗi heartbeat không bao giờ làm dừng việc cào. `AQD_HEARTBEAT=0` để tắt.
+- Test offline: `python3 tests/test_heartbeat.py`.
+
 ## Lấy những gì
 Nguồn: danh sách `https://www.foody.vn/ho-chi-minh/o-dau` (JSON công khai trang này dùng), không đăng nhập, không vượt captcha.
 Mỗi quán → `foody_data/<foody_id>/place.json`:
