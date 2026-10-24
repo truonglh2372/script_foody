@@ -37,6 +37,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 
+def _make_heartbeat():
+    """Crawler heartbeat for the daily Slack ops report (an_uong_quanh_day#1021). Token: env AQD_INGEST_TOKEN or the
+    AQD_INGEST_TOKEN line of <AQD_ROOT>/creds.env; none -> no-op. Best effort, never stops the crawl."""
+    try:
+        import heartbeat
+        aqd_root = os.environ.get("AQD_ROOT") or ("C:/aqd" if os.name == "nt" else os.path.expanduser("~/aqd"))
+        return heartbeat.Heartbeat("script_foody", ROOT, env_file=os.path.join(aqd_root, "creds.env"))
+    except Exception:
+        return None
+
+
+HB = None
+
+
+def hb(method, *args, **kwargs):
+    try:
+        return getattr(HB, method)(*args, **kwargs) if HB else None
+    except Exception:
+        return None
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -73,6 +94,7 @@ class Client:
                 not raw and "text/html" in r.headers.get("content-type", "") and "System Busy" in r.text[:600])
             if busy:
                 print(f"  ! {r.status_code} busy {url} -> chờ {back}s", flush=True)
+                hb("note", "rate_limited", f"Foody {r.status_code} busy, backoff {back}s")
                 time.sleep(back); back = min(back * 2, 600); continue
             if r.status_code == 404:
                 return None
@@ -285,6 +307,8 @@ def main(argv=None):
                     help="chia việc 2 máy theo Foody id: odd (Mac) / even (Admin)")
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
+    global HB
+    HB = _make_heartbeat()
     stp = os.path.join(ROOT, "_state.json")
     try:
         st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
@@ -302,13 +326,17 @@ def main(argv=None):
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
             if pusher: pusher.drain_and_stop(); pusher.t.join()
+            hb("beat", "dừng (STOP)", status="idle", force=True)
             break
         if pusher and free_gb() < a.min_free_gb:
             print(f"ổ còn {free_gb():.1f} GB < {a.min_free_gb} GB -> tạm ngừng cào 5 phút, uploader đang xoá ảnh đã lên", flush=True)
+            hb("note", "disk_full", f"disk {free_gb():.1f} GB < {a.min_free_gb} GB")
+            hb("beat", "tạm ngừng: ổ đầy", status="blocked", force=True)
             time.sleep(300); continue
         items, total = list_page(c, page)
         print(f"trang {page}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
+            hb("beat", "hết danh sách, nghỉ 10 phút", status="idle")
             print("hết danh sách, nghỉ 10 phút"); time.sleep(600); page = 1; continue
         for it in items:
             if a.limit and n >= a.limit:
@@ -329,13 +357,16 @@ def main(argv=None):
                     print(f"  ✓ #{fid} {rec['name']} | {len(rec['opening_periods'])} ca | {len(rec['menu'])} món | ảnh {k}/{len(rec['photos'])}", flush=True)
                     if pusher:
                         pusher.append_reviews(fid, rec); pusher.q.put(fid)
+                    hb("record_place", True, photos=k, dishes=len(rec["menu"]))
                 st["done"][fid] = now(); n += 1
             except Exception as e:
                 st["failed"][fid] = st["failed"].get(fid, 0) + 1
                 print(f"  ✗ #{fid}: {e}", flush=True)
+                hb("record_place", False); hb("note", None, f"#{fid}: {type(e).__name__}: {str(e)[:120]}")
                 if st["failed"][fid] >= 3:
                     st["done"][fid] = "skip-3-fails"
             _save_state(st, stp)
+            hb("beat", f"trang {page}: #{fid}", range_label=f"trang {page}")
         page += 1; st["page"] = page
         _save_state(st, stp)
     print(f"xong: {n} quán")
