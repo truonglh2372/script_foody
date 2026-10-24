@@ -20,7 +20,7 @@ _state.json in memory and would overwrite the edit). It writes a backup _state.j
 The crawler then retries AQD_FOODY_GALLERY_RETRY_PER_PAGE (default 3) queued places before each list page.
 """
 from __future__ import annotations
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -101,17 +101,59 @@ def read_ids(path):
     return out
 
 
+_CRAWLER_SCRIPT = re.compile(r"""(?:^|[\\/\s"'])foody_fetch\.py(?:["'\s]|$)""", re.I)
+_FIRST_TOKEN = re.compile(r"""^\s*(?:"([^"]*)"|'([^']*)'|(\S+))""")
+
+
+def _exe_name(cmd):
+    """Basename of the executable of a command line (quoted or not), lowercased."""
+    m = _FIRST_TOKEN.match(cmd or "")
+    exe = next((x for x in (m.groups() if m else ()) if x), "")
+    return re.split(r"[\\/]", exe)[-1].lower()
+
+
+def crawler_pids(procs, exclude=()):
+    """an_uong_quanh_day#1106: PIDs of real crawler processes in `procs` [(pid, ppid, command line)].
+
+    A crawler is a python interpreter whose command line runs foody_fetch.py. Not a crawler: this script and its
+    parent (`exclude`), the process-list helper itself (a PowerShell/ps whose own command line mentions the name,
+    the Windows bug that always answered "running"), shells/editors that only mention the file, and replay runs."""
+    skip = {int(x) for x in exclude if x is not None}
+    out = []
+    for pid, _ppid, cmd in procs:
+        if pid is None or int(pid) in skip or not cmd:
+            continue
+        if not _exe_name(cmd).startswith("python"):
+            continue
+        if "replay_missing_photos" in cmd or not _CRAWLER_SCRIPT.search(cmd):
+            continue
+        out.append(int(pid))
+    return out
+
+
+def _list_processes(nt=None):
+    """[(pid, ppid, command line)] of all processes. The listing command never names the crawler."""
+    if (os.name == "nt") if nt is None else nt:
+        ps = ("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | "
+              "ConvertTo-Json -Compress")
+        raw = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        rows = json.loads(raw or "[]")
+        rows = [rows] if isinstance(rows, dict) else rows
+        return [(r.get("ProcessId"), r.get("ParentProcessId"), r.get("CommandLine") or "") for r in rows]
+    raw = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=30).stdout
+    out = []
+    for line in raw.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            out.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+    return out
+
+
 def crawler_running():
-    """True / False / None (unknown). Looks for a foody_fetch.py process."""
+    """True / False / None (unknown). Looks for a real foody_fetch.py crawler, never this script or its helper."""
     try:
-        if os.name == "nt":
-            out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'foody_fetch' } | "
-                                  "Measure-Object | Select-Object -ExpandProperty Count"],
-                                 capture_output=True, text=True, timeout=60).stdout.strip()
-            return int(out or 0) > 0
-        out = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True, timeout=30).stdout
-        return any("foody_fetch.py" in l and "replay_missing_photos" not in l for l in out.splitlines())
+        return bool(crawler_pids(_list_processes(), exclude=(os.getpid(), os.getppid())))
     except Exception:
         return None
 

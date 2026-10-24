@@ -98,5 +98,71 @@ class Replay(unittest.TestCase):
         self.assertEqual(sorted(ff.due_gallery_retries(st, limit=10)), ["11", "19"])
 
 
+# Process lists as seen on Admin (Windows) and the Mac during the 2026-10-25 rollout (an_uong_quanh_day#1106).
+VENV = r'"C:\script_foody\.venv\Scripts\python.exe"  -u "C:\script_foody\common\foody_fetch.py" --limit 0 --parity even'
+CHILD = (r'"C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe" -u '
+         r'"C:\script_foody\common\foody_fetch.py" --limit 0 --parity even')
+WRAPPER = (r'cmd /c ""C:\script_foody\.venv\Scripts\python.exe" -u "C:\script_foody\common\foody_fetch.py" '
+           r'--limit 0 --parity even >> "C:\script_foody\foody_data\fetch.log" 2>&1"')
+OLD_HELPER = ("powershell -NoProfile -Command Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "
+              "'foody_fetch' } | Measure-Object | Select-Object -ExpandProperty Count")
+SELF = r'"C:\script_foody\.venv\Scripts\python.exe" scripts\replay_missing_photos.py enqueue --ids-file x.tsv --apply'
+MAC = ("/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/"
+       "Contents/MacOS/Python -u /Users/x/script_foody/common/foody_fetch.py --limit 0 --parity odd")
+
+
+class CrawlerDetection(unittest.TestCase):
+    def test_old_windows_helper_is_not_a_crawler(self):
+        # the bug: the PowerShell helper's own command line contains 'foody_fetch' -> always "running"
+        self.assertEqual(rp.crawler_pids([(500, 400, OLD_HELPER), (400, 300, SELF)], exclude=(400, 300)), [])
+
+    def test_real_windows_crawler_found(self):
+        procs = [(11064, 1, WRAPPER), (9184, 11064, VENV), (11932, 9184, CHILD), (500, 400, OLD_HELPER),
+                 (400, 300, SELF)]
+        self.assertEqual(rp.crawler_pids(procs, exclude=(400, 300)), [9184, 11932])
+
+    def test_own_pid_and_parent_excluded_even_if_they_match(self):
+        self.assertEqual(rp.crawler_pids([(7, 6, VENV), (6, 5, CHILD), (8, 1, MAC)], exclude=(7, 6)), [8])
+
+    def test_mac_framework_python_found(self):
+        self.assertEqual(rp.crawler_pids([(8940, 1, MAC)]), [8940])
+
+    def test_mentions_without_running_are_ignored(self):
+        procs = [(1, 0, "vim common/foody_fetch.py"), (2, 0, "grep foody_fetch fetch.log"),
+                 (3, 0, "tail -f /x/foody_data/fetch.log"), (4, 0, "python3 tests/test_foody_fetch.py"),
+                 (5, 0, "python3 /x/common/foody_fetch.pyc"), (6, 0, "python3 scripts/replay_missing_photos.py enqueue"),
+                 (7, 0, ""), (None, 0, MAC)]
+        self.assertEqual(rp.crawler_pids(procs), [])
+
+    def test_windows_listing_parsed_and_self_excluded(self):
+        rows = [{"ProcessId": 11932, "ParentProcessId": 9184, "CommandLine": CHILD},
+                {"ProcessId": os.getpid(), "ParentProcessId": os.getppid(), "CommandLine": VENV},
+                {"ProcessId": 4, "ParentProcessId": 0, "CommandLine": None}]
+        done = mock.Mock(stdout=json.dumps(rows))
+        with mock.patch.object(rp.subprocess, "run", return_value=done) as run_:
+            procs = rp._list_processes(nt=True)
+        self.assertNotIn("foody_fetch", " ".join(run_.call_args[0][0]))   # the helper never names the crawler
+        self.assertEqual(procs[0], (11932, 9184, CHILD))
+        with mock.patch.object(rp, "_list_processes", return_value=procs):
+            self.assertTrue(rp.crawler_running())
+        with mock.patch.object(rp, "_list_processes", return_value=procs[1:]):
+            self.assertFalse(rp.crawler_running())                    # only ourselves left -> not running
+
+    def test_windows_single_process_json_object(self):
+        done = mock.Mock(stdout=json.dumps({"ProcessId": 3, "ParentProcessId": 1, "CommandLine": CHILD}))
+        with mock.patch.object(rp.subprocess, "run", return_value=done):
+            self.assertEqual(rp._list_processes(nt=True), [(3, 1, CHILD)])
+
+    def test_posix_listing_parsed(self):
+        done = mock.Mock(stdout="  8940     1 " + MAC + "\n   12     1 /sbin/launchd\n  x y z\n")
+        with mock.patch.object(rp.subprocess, "run", return_value=done):
+            procs = rp._list_processes(nt=False)
+        self.assertEqual(procs, [(8940, 1, MAC), (12, 1, "/sbin/launchd")])
+
+    def test_listing_failure_is_unknown(self):
+        with mock.patch.object(rp, "_list_processes", side_effect=OSError("no ps")):
+            self.assertIsNone(rp.crawler_running())
+
+
 if __name__ == "__main__":
     unittest.main()
