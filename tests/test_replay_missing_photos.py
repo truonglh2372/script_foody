@@ -1,0 +1,102 @@
+"""Tests for scripts/replay_missing_photos.py (re-fetch of Foody places imported with 0 photos, #1081).
+Temp data dir only; no network. Run: python3 tests/test_replay_missing_photos.py"""
+import io, json, os, sys, tempfile, time, unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+import replay_missing_photos as rp  # noqa: E402
+
+
+def make_root():
+    root = tempfile.mkdtemp(prefix="replay_")
+    places = {
+        "11": {"albums": {"3": 2, "2": 9, "1": 4}, "total_pictures": 15},   # candidate (menu+dish)
+        "13": {"albums": {"1": 4, "4": 2}, "total_pictures": 6},            # venue/other only -> not a candidate
+        "15": {"albums": {"2": 3}, "total_pictures": 3},                    # already has photos
+        "17": {"albums": {"2": 3}, "total_pictures": 3},                    # never imported
+        "19": {"total_pictures": 4},                                        # old record without album counts
+    }
+    for fid, p in places.items():
+        os.makedirs(os.path.join(root, fid))
+        p.update({"source_id": fid, "name": f"quan {fid}", "source_url": f"https://www.foody.vn/ho-chi-minh/q{fid}"})
+        json.dump(p, open(os.path.join(root, fid, "place.json"), "w"))
+    json.dump({"11": {"restaurant_id": 111, "photos": []}, "13": {"restaurant_id": 113, "photos": []},
+               "15": {"restaurant_id": 115, "photos": ["x"]}, "19": {"restaurant_id": 119}},
+              open(os.path.join(root, "_uploaded.json"), "w"))
+    stp = os.path.join(root, "_state.json")
+    json.dump({"page": 40, "done": {"11": "t", "19": "t"}, "failed": {}}, open(stp, "w"))
+    old = time.time() - 3600
+    os.utime(stp, (old, old))
+    return root
+
+
+def run(argv):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = rp.main(argv)
+    return rc, buf.getvalue()
+
+
+class Replay(unittest.TestCase):
+    def setUp(self):
+        self.root = make_root(); self.ids = os.path.join(self.root, "ids.tsv")
+        self.stp = os.path.join(self.root, "_state.json")
+
+    def test_list_picks_only_menu_or_dish_places(self):
+        rc, out = run(["list", "--root", self.root, "--out", self.ids])
+        self.assertEqual(rc, 0)
+        self.assertEqual(rp.read_ids(self.ids), ["11", "19"])
+        self.assertIn('"only_venue_or_other_albums": 1', out)
+
+    def test_dry_run_writes_nothing(self):
+        run(["list", "--root", self.root, "--out", self.ids])
+        before = open(self.stp).read()
+        rc, out = run(["enqueue", "--root", self.root, "--ids-file", self.ids])
+        self.assertEqual(rc, 0)
+        self.assertIn("DRY RUN", out)
+        self.assertIn("max 5 per place", out)
+        self.assertEqual(open(self.stp).read(), before)
+
+    def test_apply_refused_while_crawler_runs(self):
+        run(["list", "--root", self.root, "--out", self.ids])
+        with mock.patch.object(rp, "crawler_running", return_value=True):
+            rc, out = run(["enqueue", "--root", self.root, "--ids-file", self.ids, "--apply"])
+        self.assertEqual(rc, 3)
+        self.assertNotIn("gallery_retry", json.load(open(self.stp)))
+
+    def test_apply_refused_when_state_fresh(self):
+        run(["list", "--root", self.root, "--out", self.ids])
+        os.utime(self.stp, None)
+        with mock.patch.object(rp, "crawler_running", return_value=False):
+            rc, _ = run(["enqueue", "--root", self.root, "--ids-file", self.ids, "--apply"])
+        self.assertEqual(rc, 3)
+
+    def test_apply_queues_for_gallery_retry_with_backup(self):
+        run(["list", "--root", self.root, "--out", self.ids])
+        with mock.patch.object(rp, "crawler_running", return_value=False):
+            rc, out = run(["enqueue", "--root", self.root, "--ids-file", self.ids, "--apply", "--limit", "1"])
+        self.assertEqual(rc, 0)
+        st = json.load(open(self.stp))
+        self.assertEqual(list(st["gallery_retry"]), ["11"])
+        e = st["gallery_retry"]["11"]
+        self.assertEqual((e["next_at"], e["tries"], e["item"]["Url"], e["item"]["Id"]), (0, 0, "/ho-chi-minh/q11", 11))
+        self.assertEqual(st["page"], 40)
+        self.assertTrue(any(f.startswith("_state.json.pre-replay-") for f in os.listdir(self.root)))
+
+    def test_queued_item_is_due_for_the_crawler(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
+        try:
+            import foody_fetch as ff
+        except ImportError:
+            self.skipTest("requests not installed")
+        run(["list", "--root", self.root, "--out", self.ids])
+        with mock.patch.object(rp, "crawler_running", return_value=False):
+            run(["enqueue", "--root", self.root, "--ids-file", self.ids, "--apply"])
+        st = json.load(open(self.stp))
+        self.assertEqual(sorted(ff.due_gallery_retries(st, limit=10)), ["11", "19"])
+
+
+if __name__ == "__main__":
+    unittest.main()

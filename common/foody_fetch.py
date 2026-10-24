@@ -11,7 +11,8 @@ Dùng:
   python common/foody_fetch.py --limit 0             # chạy hết (vòng lặp vô hạn trang)
   python common/foody_fetch.py --ids 30086 12345     # chỉ các id này (cần url trong state)
   --no-photos     chỉ lấy JSON, không tải ảnh
-  --max-photos N  tối đa N ảnh mỗi quán (mặc định 30)
+  --max-photos N  tối đa N ảnh mỗi quán (mặc định 5 = AQD_FOODY_MAX_PHOTOS): CHỈ ảnh thực đơn trước, rồi ảnh món
+  --max-reviews N tối đa N review mỗi quán (mặc định 50 = AQD_MAX_REVIEWS), lật trang review đến khi đủ/hết
 Kết quả: foody_data/<foody_id>/place.json + photos/*.jpg ; tiến độ foody_data/_state.json
 """
 from __future__ import annotations
@@ -31,10 +32,34 @@ DELAY = float(os.environ.get("AQD_FOODY_DELAY", "2.0"))
 ROOT = os.environ.get("AQD_FOODY_DATA", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "foody_data"))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/129.0 Safari/537.36")
-# predefineAlbumId của Foody -> vai trò ảnh bên mình
-ALBUMS = {3: "menu", 2: "food", 1: "interior", 4: "other"}
+# predefineAlbumId của Foody -> vai trò ảnh bên mình. Thứ tự = thứ tự ưu tiên.
+# an_uong_quanh_day#1082: CHỈ ảnh thực đơn (3) rồi ảnh món ăn/đồ uống (2). Không gian (1) / Tổng hợp (4) = ảnh quán,
+# người, linh tinh -> không lấy nữa.
+ALBUMS = {3: "menu", 2: "food"}
+KEEP_ROLES = ("menu", "food")
+MAX_PHOTOS = int(os.environ.get("AQD_FOODY_MAX_PHOTOS", "5"))
+# an_uong_quanh_day#1083: up to this many reviews per place, paging Foody's review list until the cap or the end.
+MAX_REVIEWS = int(os.environ.get("AQD_MAX_REVIEWS", "50"))
+REVIEW_PAGE = 10  # what foody.vn's own "xem thêm" asks for
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+PAGE_SIZE = 12  # HomeListPlace count=12
+
+# an_uong_quanh_day#1080: an empty list page or one without Total is NOT the end of the list unless the page is past
+# the last known total. Retry the same page with backoff, then skip it; never jump back to page 1 early.
+LIST_RETRIES = int(os.environ.get("AQD_FOODY_LIST_RETRIES", "5"))
+LIST_BACKOFF = float(os.environ.get("AQD_FOODY_LIST_BACKOFF", "30"))          # 30s, 60s, 120s ... capped
+LIST_BACKOFF_MAX = float(os.environ.get("AQD_FOODY_LIST_BACKOFF_MAX", "600"))
+LIST_SKIP_STREAK = int(os.environ.get("AQD_FOODY_LIST_SKIP_STREAK", "5"))     # this many skipped pages in a row ->
+LIST_SKIP_PAUSE = float(os.environ.get("AQD_FOODY_LIST_SKIP_PAUSE", "1800"))  # long pause (Foody is throttling)
+END_PAUSE = 600
+
+# an_uong_quanh_day#1081: a gallery fetch that errors (503/busy, non-JSON, give-up) or comes back empty while the
+# album counts say there are photos must not mark the place done; it is queued in _state.json "gallery_retry".
+GALLERY_TRIES = int(os.environ.get("AQD_FOODY_GALLERY_TRIES", "5"))
+GALLERY_BACKOFF = float(os.environ.get("AQD_FOODY_GALLERY_BACKOFF", "900"))    # 15 min, 30, 60 ... capped
+GALLERY_BACKOFF_MAX = float(os.environ.get("AQD_FOODY_GALLERY_BACKOFF_MAX", "21600"))
+GALLERY_RETRY_PER_PAGE = int(os.environ.get("AQD_FOODY_GALLERY_RETRY_PER_PAGE", "3"))  # retries done before each list page
 
 
 def _make_heartbeat():
@@ -203,14 +228,44 @@ def menu(c, fid, ref, cap=500):
     return items[:cap]
 
 
-def photos(c, fid, ref, max_n):
-    out = []
+class GalleryError(Exception):
+    """The photo gallery could not be read reliably; the place stays retryable (#1081)."""
+
+
+def _album_counts(albums):
+    out = {}
+    for k, v in (albums or {}).items():
+        try:
+            out[int(k)] = int(v or 0)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def photos(c, fid, ref, max_n, expected=None):
+    """Menu photos first, then dish (food/drink) photos, max_n in total (#1082). No venue/people/other albums.
+    expected = album counts from the place page ({predefineAlbumId: count}). Raises GalleryError when an album that
+    was needed and should hold photos errors out (busy after retries, non-JSON, 404), or when both albums come back
+    empty although the counts say they have photos (#1081)."""
+    out, errors = [], []
+    exp = _album_counts(expected)
+    if max_n <= 0:
+        return []
     for album, role in ALBUMS.items():
-        page = 1
+        if len(out) >= max_n:
+            break
+        if exp and exp.get(album, 0) <= 0:
+            continue  # the place page says this album is empty: no request
+        page, size = 1, 20
         while len(out) < max_n:
-            d = c.json(f"/__get/Gallery/ListRestaurantPicturesWithPaging?pageIndex={page}&pageSize=20&restaurantId={fid}"
-                       f"&predefineAlbumId={album}&albumId=0&userId=0&orderAscByTime=1&isProfessional=false",
-                       referer=ref + "/album-anh") or {}
+            try:
+                d = c.json(f"/__get/Gallery/ListRestaurantPicturesWithPaging?pageIndex={page}&pageSize={size}&restaurantId={fid}"
+                           f"&predefineAlbumId={album}&albumId=0&userId=0&orderAscByTime=1&isProfessional=false",
+                           referer=ref + "/album-anh")
+            except Exception as e:  # Client.get gave up (busy x6) or HTTP error
+                errors.append((album, f"{type(e).__name__}: {str(e)[:80]}")); break
+            if not isinstance(d, dict):
+                errors.append((album, "no JSON")); break
             rows = d.get("data") or []
             for p in rows:
                 if p.get("MediaType") not in (None, 0, 1) or not p.get("FullSizeImageUrl"):
@@ -218,18 +273,30 @@ def photos(c, fid, ref, max_n):
                 out.append({"foody_photo_id": p.get("Id"), "url": p["FullSizeImageUrl"], "album": role,
                             "width": (p.get("Size") or {}).get("Width"), "height": (p.get("Size") or {}).get("Height"),
                             "owner": p.get("OwnerFullName")})
-            if len(rows) < 20:
+                if len(out) >= max_n:
+                    break
+            if len(rows) < size:
                 break
             page += 1
-    return out[:max_n]
+    bad = [(a, e) for a, e in errors if exp.get(a, 1) > 0]
+    if bad:
+        raise GalleryError("gallery error: " + "; ".join(f"album {a}: {e}" for a, e in bad))
+    want = sum(exp.get(a, 0) for a in ALBUMS)
+    if want > 0 and not out:
+        raise GalleryError(f"gallery empty but album counts say {want} menu/dish photos")
+    return filter_photos(out, max_n)
 
 
-def filter_photos(items):
-    """#855: no local model. Keep every photo of the Thực đơn / Món ăn / Không gian albums; the API classifies
-    each upload. 'Tổng hợp' (album other) has no import role the API accepts yet, so it stays local only."""
-    for it in items:
-        it["keep"] = it["album"] != "other"
-    return items
+def filter_photos(items, max_n=None):
+    """#1082: keep ONLY menu and dish photos, menu first, then dishes, at most max_n (default AQD_FOODY_MAX_PHOTOS).
+    Returns the kept photos (each keep=True) in that order; venue/people/other photos are dropped."""
+    max_n = MAX_PHOTOS if max_n is None else max_n
+    rank = {r: i for i, r in enumerate(KEEP_ROLES)}
+    keep = sorted((it for it in items if it.get("album") in rank), key=lambda it: rank[it["album"]])  # stable
+    keep = keep[:max(0, max_n)]
+    for it in keep:
+        it["keep"] = True
+    return keep
 
 
 def download(c, items, folder):
@@ -255,6 +322,61 @@ def _review_id(x):
     return str(rid) if rid else None
 
 
+def _foody_date(x):
+    m = re.search(r"/Date\((-?\d+)", str(x or ""))
+    if not m:
+        return x or None
+    return datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).isoformat(timespec="seconds")
+
+
+def review_row(x):
+    """One item of /__get/Review/ResLoadMore -> the place.json review shape (same keys as the list-item sample)."""
+    rid = x.get("Id")
+    return {"source": "foody", "source_id": str(rid) if rid else None, "imported_from": "foody",
+            "rating": x.get("AvgRating"), "title": x.get("Title"), "text": x.get("Description"),
+            "author": (x.get("Owner") or {}).get("DisplayName"), "created_at": _foody_date(x.get("CreatedDate")),
+            "source_url": BASE + x["Url"] if x.get("Url") else None}
+
+
+def sample_rows(item):
+    return [{"source": "foody", "source_id": _review_id(x), "imported_from": "foody",
+             "rating": x.get("AvgRating"), "text": x.get("Comment"),
+             "author": x.get("reviewUserDisplayName"), "created_at": x.get("CreatedOn"),
+             "source_url": BASE + (x.get("reviewUrl") or "")}
+            for x in item.get("LstReview") or []]
+
+
+def reviews(c, fid, ref, cap, seed=()):
+    """#1083: newest reviews of the place, paging Foody's review list (REVIEW_PAGE per request) until `cap` or the
+    source runs out; the list item's LstReview sample (`seed`) fills in anything paging did not return.
+    Best effort: a failing page keeps what was read so far (reviews never block a place)."""
+    out, seen = [], set()
+
+    def add(r):
+        if r.get("source_id") and r["source_id"] not in seen and len(out) < cap:
+            seen.add(r["source_id"]); out.append(r)
+
+    last, pages = "", 0
+    while cap > 0 and len(out) < cap and pages < cap // REVIEW_PAGE + 3:
+        pages += 1
+        try:
+            d = c.json(f"/__get/Review/ResLoadMore?t={int(time.time() * 1000)}&ResId={fid}&Count={REVIEW_PAGE}"
+                       f"&LastId={last}&Type=1&isLatest=true&ExcludeIds=", referer=ref + "/binh-luan")
+        except Exception as e:
+            print(f"  ! review #{fid} trang {pages}: {type(e).__name__} -> giữ {len(out)} review", flush=True); break
+        rows = (d or {}).get("Items") or [] if isinstance(d, dict) else []
+        before = len(out)
+        for x in rows:
+            add(review_row(x))
+        nxt = str(d.get("LastId") or "") if isinstance(d, dict) else ""
+        if len(rows) < REVIEW_PAGE or not nxt or nxt == last or len(out) == before:
+            break
+        last = nxt
+    for r in seed:
+        add(r)
+    return out
+
+
 def fetch_place(c, item, args):
     fid, url = item["Id"], item["Url"]
     ref = BASE + url
@@ -265,10 +387,10 @@ def fetch_place(c, item, args):
     days, periods = opening(c, fid, url)
     phones = phone(c, fid, url) if not det.get("phone") else [re.sub(r"\D", "", det["phone"])]
     mn = menu(c, fid, url)
-    ph = photos(c, fid, url, args.max_photos) if not args.no_photos else []
+    ph = photos(c, fid, url, args.max_photos, expected=det.get("albums")) if not args.no_photos else []
     if ph:
-        filter_photos(ph)
         download(c, ph, os.path.join(ROOT, str(fid), "photos"))
+    rv = reviews(c, fid, url, getattr(args, "max_reviews", MAX_REVIEWS), seed=sample_rows(item))
     rec = {
         "source": "foody", "source_id": str(fid), "source_url": ref, "fetched_at": now(),
         **det,
@@ -278,12 +400,9 @@ def fetch_place(c, item, args):
         "review_count": det.get("review_count") or item.get("TotalReviews"),
         "opening_hours": days, "opening_periods": periods,
         "menu": mn,
-        # Mọi review Foody gắn source='foody' + source_id để xoá hàng loạt (issue #682)
-        "reviews_sample": [{"source": "foody", "source_id": _review_id(x), "imported_from": "foody",
-                            "rating": x.get("AvgRating"), "text": x.get("Comment"),
-                            "author": x.get("reviewUserDisplayName"), "created_at": x.get("CreatedOn"),
-                            "source_url": BASE + (x.get("reviewUrl") or "")}
-                           for x in item.get("LstReview") or []],
+        # Mọi review Foody gắn source='foody' + source_id để xoá hàng loạt (issue #682).
+        # Tên khoá giữ "reviews_sample" (foody_upload/foody_push đọc khoá này) nhưng giờ là tối đa AQD_MAX_REVIEWS review.
+        "reviews_sample": rv,
         "photos": [{**p, "source": "foody", "source_id": str(p.get("foody_photo_id")),
                     "source_url": p["url"]} for p in ph],
     }
@@ -291,11 +410,116 @@ def fetch_place(c, item, args):
     return rec
 
 
+def plan_empty_page(st, page, total, page_size=PAGE_SIZE, retries=None, backoff=None, backoff_max=None,
+                    skip_streak=None):
+    """What to do with an EMPTY list page (#1080). Mutates st (list_retry, skip_streak, skipped_pages, total).
+    Returns (action, next_page, wait_seconds):
+      "end"   - genuinely past the last known total (or no total was ever seen): pause, then page 1
+      "retry" - same page again after wait (Total missing / page still below the known total)
+      "skip"  - retries used up: move on to page+1 (wait > 0 = long pause first, Foody keeps refusing)"""
+    retries = LIST_RETRIES if retries is None else retries
+    backoff = LIST_BACKOFF if backoff is None else backoff
+    backoff_max = LIST_BACKOFF_MAX if backoff_max is None else backoff_max
+    skip_streak = LIST_SKIP_STREAK if skip_streak is None else skip_streak
+    if isinstance(total, int) and total > 0:
+        st["total"] = total
+    known = st.get("total")
+    if not known or (page - 1) * page_size >= int(known):
+        st["list_retry"] = 0; st["skip_streak"] = 0
+        return "end", 1, END_PAUSE
+    n = int(st.get("list_retry") or 0) + 1
+    if n <= retries:
+        st["list_retry"] = n
+        return "retry", page, min(backoff * (2 ** (n - 1)), backoff_max)
+    st["list_retry"] = 0
+    st["skipped_pages"] = (list(st.get("skipped_pages") or []) + [page])[-200:]
+    streak = int(st.get("skip_streak") or 0) + 1
+    if streak >= skip_streak:
+        st["skip_streak"] = 0
+        return "skip", page + 1, LIST_SKIP_PAUSE
+    st["skip_streak"] = streak
+    return "skip", page + 1, 0
+
+
+def note_page_ok(st, total):
+    if isinstance(total, int) and total > 0:
+        st["total"] = total
+    st["list_retry"] = 0; st["skip_streak"] = 0
+
+
+def _slim_item(it):
+    """What fetch_place needs from a list item, kept in _state.json for a gallery retry."""
+    return {k: it.get(k) for k in ("Id", "Url", "Phone", "Address", "AvgRating", "TotalReviews", "LstReview")}
+
+
+def queue_gallery_retry(st, fid, item, err, now_ts=None, tries=None, backoff=None, backoff_max=None):
+    """#1081: keep the place out of "done" and schedule another full fetch with backoff. Returns the entry.
+    After `tries` failures it moves to st["gallery_failed"] (still NOT done, so the next list pass picks it up)."""
+    tries = GALLERY_TRIES if tries is None else tries
+    backoff = GALLERY_BACKOFF if backoff is None else backoff
+    backoff_max = GALLERY_BACKOFF_MAX if backoff_max is None else backoff_max
+    now_ts = time.time() if now_ts is None else now_ts
+    q = st.setdefault("gallery_retry", {})
+    e = q.get(fid) or {"tries": 0}
+    e = {"tries": int(e.get("tries") or 0) + 1, "item": _slim_item(item), "error": str(err)[:200], "at": now()}
+    st.get("done", {}).pop(fid, None)
+    if e["tries"] >= tries:
+        q.pop(fid, None)
+        st.setdefault("gallery_failed", {})[fid] = {"tries": e["tries"], "error": e["error"], "at": e["at"]}
+        return e
+    e["next_at"] = now_ts + min(backoff * (2 ** (e["tries"] - 1)), backoff_max)
+    q[fid] = e
+    return e
+
+
+def due_gallery_retries(st, now_ts=None, limit=GALLERY_RETRY_PER_PAGE):
+    now_ts = time.time() if now_ts is None else now_ts
+    q = st.get("gallery_retry") or {}
+    due = sorted((e.get("next_at", 0), fid) for fid, e in q.items() if e.get("next_at", 0) <= now_ts)
+    return [fid for _, fid in due[:limit]]
+
+
+def process_item(c, it, a, st, pusher, retry=False):
+    """Fetch one place, write place.json, hand it to the pusher. Returns "ok" | "none" | "gallery" | "error"."""
+    fid = str(it["Id"])
+    try:
+        rec = fetch_place(c, it, a)
+        if rec:
+            d = os.path.join(ROOT, fid); os.makedirs(d, exist_ok=True)
+            tmp = os.path.join(d, "place.json.tmp")
+            json.dump(rec, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+            os.replace(tmp, os.path.join(d, "place.json"))
+            k = sum(1 for p in rec["photos"] if p.get("keep"))
+            print(f"  ✓ #{fid} {rec['name']} | {len(rec['opening_periods'])} ca | {len(rec['menu'])} món | ảnh {k}/{len(rec['photos'])}"
+                  + (" (gallery retry ok)" if retry else ""), flush=True)
+            if pusher:
+                pusher.append_reviews(fid, rec); pusher.q.put(fid)
+            hb("record_place", True, photos=k, dishes=len(rec["menu"]))
+        st["done"][fid] = now()
+        (st.get("gallery_retry") or {}).pop(fid, None); (st.get("gallery_failed") or {}).pop(fid, None)
+        return "ok" if rec else "none"
+    except GalleryError as e:
+        ent = queue_gallery_retry(st, fid, it, e)
+        when = (f"thử lại sau {int(ent['next_at'] - time.time())}s" if "next_at" in ent
+                else "hết lượt, chờ vòng danh sách sau")
+        print(f"  ↻ #{fid}: {e} -> CHƯA xong, {when} (lần {ent['tries']}/{GALLERY_TRIES})", flush=True)
+        hb("record_place", False); hb("note", "rate_limited", f"#{fid}: {str(e)[:120]}")
+        return "gallery"
+    except Exception as e:
+        st["failed"][fid] = st["failed"].get(fid, 0) + 1
+        print(f"  ✗ #{fid}: {e}", flush=True)
+        hb("record_place", False); hb("note", None, f"#{fid}: {type(e).__name__}: {str(e)[:120]}")
+        if st["failed"][fid] >= 3:
+            st["done"][fid] = "skip-3-fails"
+        return "error"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--start-page", type=int, default=None)
-    ap.add_argument("--max-photos", type=int, default=int(os.environ.get("AQD_FOODY_MAX_PHOTOS", "30")))
+    ap.add_argument("--max-photos", type=int, default=MAX_PHOTOS, help="AQD_FOODY_MAX_PHOTOS, mặc định 5 (menu trước rồi món)")
+    ap.add_argument("--max-reviews", type=int, default=MAX_REVIEWS, help="AQD_MAX_REVIEWS, mặc định 50")
     ap.add_argument("--no-photos", action="store_true")
     ap.add_argument("--no-clip", action="store_true", help="bỏ (#855): không còn CLIP local, giữ để lệnh cũ không lỗi")
     ap.add_argument("--refetch", action="store_true")
@@ -315,13 +539,14 @@ def main(argv=None):
     except Exception as e:
         print(f"[warn] _state.json hỏng ({e}) -> dùng bản .bak nếu có", flush=True)
         st = json.load(open(stp + ".bak", encoding="utf-8")) if os.path.exists(stp + ".bak") else {"page": 1, "done": {}, "failed": {}}
+    st.setdefault("done", {}); st.setdefault("failed", {})
     pusher = None
     if not a.no_push:
         from foody_push import Pusher, free_gb
         pusher = Pusher().start()
     page = a.start_page or st.get("page", 1)
     c, n = Client(), 0
-    print(f"parity={a.parity}", flush=True)
+    print(f"parity={a.parity} page={page} known_total={st.get('total')}", flush=True)
     while a.limit == 0 or n < a.limit:
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
@@ -333,11 +558,30 @@ def main(argv=None):
             hb("note", "disk_full", f"disk {free_gb():.1f} GB < {a.min_free_gb} GB")
             hb("beat", "tạm ngừng: ổ đầy", status="blocked", force=True)
             time.sleep(300); continue
+        for fid in due_gallery_retries(st):  # #1081: places whose gallery failed earlier
+            ent = st["gallery_retry"][fid]
+            print(f"  ↻ thử lại ảnh #{fid} (lần {ent['tries'] + 1})", flush=True)
+            if process_item(c, ent["item"], a, st, pusher, retry=True) == "ok":
+                n += 1
+            _save_state(st, stp)
         items, total = list_page(c, page)
         print(f"trang {page}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
-            hb("beat", "hết danh sách, nghỉ 10 phút", status="idle")
-            print("hết danh sách, nghỉ 10 phút"); time.sleep(600); page = 1; continue
+            action, nxt, wait = plan_empty_page(st, page, total)
+            if action == "end":
+                hb("beat", "hết danh sách, nghỉ 10 phút", status="idle")
+                print(f"hết danh sách (trang {page} > tổng {st.get('total')}), nghỉ {int(wait // 60)} phút rồi quét lại từ trang 1", flush=True)
+            elif action == "retry":
+                hb("note", "rate_limited", f"Foody list page {page} empty (Total {total}); retry {st['list_retry']}/{LIST_RETRIES}")
+                print(f"trang {page} trống/không có tổng (đã biết tổng {st.get('total')}) -> thử lại sau {int(wait)}s "
+                      f"(lần {st['list_retry']}/{LIST_RETRIES}), KHÔNG quay về trang 1", flush=True)
+            else:
+                print(f"trang {page} vẫn trống sau {LIST_RETRIES} lần -> bỏ qua, sang trang {nxt}"
+                      + (f"; nhiều trang liền bị bỏ, nghỉ {int(wait // 60)} phút" if wait else ""), flush=True)
+            page = nxt; st["page"] = page; _save_state(st, stp)
+            if wait: time.sleep(wait)
+            continue
+        note_page_ok(st, total)
         for it in items:
             if a.limit and n >= a.limit:
                 break
@@ -346,25 +590,10 @@ def main(argv=None):
                 continue
             if fid in st["done"] and not a.refetch:
                 continue
-            try:
-                rec = fetch_place(c, it, a)
-                if rec:
-                    d = os.path.join(ROOT, fid); os.makedirs(d, exist_ok=True)
-                    tmp = os.path.join(d, "place.json.tmp")
-                    json.dump(rec, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-                    os.replace(tmp, os.path.join(d, "place.json"))
-                    k = sum(1 for p in rec["photos"] if p.get("keep"))
-                    print(f"  ✓ #{fid} {rec['name']} | {len(rec['opening_periods'])} ca | {len(rec['menu'])} món | ảnh {k}/{len(rec['photos'])}", flush=True)
-                    if pusher:
-                        pusher.append_reviews(fid, rec); pusher.q.put(fid)
-                    hb("record_place", True, photos=k, dishes=len(rec["menu"]))
-                st["done"][fid] = now(); n += 1
-            except Exception as e:
-                st["failed"][fid] = st["failed"].get(fid, 0) + 1
-                print(f"  ✗ #{fid}: {e}", flush=True)
-                hb("record_place", False); hb("note", None, f"#{fid}: {type(e).__name__}: {str(e)[:120]}")
-                if st["failed"][fid] >= 3:
-                    st["done"][fid] = "skip-3-fails"
+            if fid in (st.get("gallery_retry") or {}):
+                continue  # waits for its own backoff slot
+            if process_item(c, it, a, st, pusher) in ("ok", "none"):
+                n += 1
             _save_state(st, stp)
             hb("beat", f"trang {page}: #{fid}", range_label=f"trang {page}")
         page += 1; st["page"] = page
