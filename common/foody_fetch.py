@@ -326,17 +326,17 @@ def main(argv=None):
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
             if pusher: pusher.drain_and_stop(); pusher.t.join()
-            hb("beat", "dừng (STOP)", force=True)
+            hb("beat", "dừng (STOP)", status="idle", force=True)
             break
         if pusher and free_gb() < a.min_free_gb:
             print(f"ổ còn {free_gb():.1f} GB < {a.min_free_gb} GB -> tạm ngừng cào 5 phút, uploader đang xoá ảnh đã lên", flush=True)
             hb("note", "disk_full", f"disk {free_gb():.1f} GB < {a.min_free_gb} GB")
-            hb("beat", "tạm ngừng: ổ đầy", status="degraded", force=True)
+            hb("beat", "tạm ngừng: ổ đầy", status="blocked", force=True)
             time.sleep(300); continue
         items, total = list_page(c, page)
         print(f"trang {page}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
-            hb("beat", "hết danh sách, nghỉ 10 phút")
+            hb("beat", "hết danh sách, nghỉ 10 phút", status="idle")
             print("hết danh sách, nghỉ 10 phút"); time.sleep(600); page = 1; continue
         for it in items:
             if a.limit and n >= a.limit:
@@ -366,7 +366,7 @@ def main(argv=None):
                 if st["failed"][fid] >= 3:
                     st["done"][fid] = "skip-3-fails"
             _save_state(st, stp)
-            hb("beat", f"trang {page}: #{fid}")
+            hb("beat", f"trang {page}: #{fid}", range_label=f"trang {page}")
         page += 1; st["page"] = page
         _save_state(st, stp)
     print(f"xong: {n} quán")
