@@ -228,6 +228,12 @@ def menu(c, fid, ref, cap=500):
     return items[:cap]
 
 
+# Foody's ListRestaurantPicturesWithPaging counts pageIndex from 0: pageIndex=1 is the SECOND page (photos 21-40),
+# so a place with fewer than 20 photos in an album came back empty ({'data': [], 'total': N}). That is how
+# ~870 places went up with 0 photos (an_uong_quanh_day#1081, verified live 24/10/2026).
+GALLERY_FIRST_PAGE = 0
+
+
 class GalleryError(Exception):
     """The photo gallery could not be read reliably; the place stays retryable (#1081)."""
 
@@ -256,7 +262,7 @@ def photos(c, fid, ref, max_n, expected=None):
             break
         if exp and exp.get(album, 0) <= 0:
             continue  # the place page says this album is empty: no request
-        page, size = 1, 20
+        page, size = GALLERY_FIRST_PAGE, 20
         while len(out) < max_n:
             try:
                 d = c.json(f"/__get/Gallery/ListRestaurantPicturesWithPaging?pageIndex={page}&pageSize={size}&restaurantId={fid}"
