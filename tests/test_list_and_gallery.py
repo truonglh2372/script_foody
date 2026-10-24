@@ -44,7 +44,7 @@ class FakeClient:
                 raise v
             if v is None:
                 return None
-            return {"data": v[(page - 1) * size: page * size]}
+            return {"data": v[page * size: (page + 1) * size], "total": len(v)}  # foody.vn: pageIndex is 0-based
         if "ResLoadMore" in path:
             last = re.search(r"LastId=(\d*)", path).group(1)
             n = sum(1 for p in self.calls if "ResLoadMore" in p)
@@ -134,6 +134,21 @@ class Gallery(unittest.TestCase):  # #1081 + #1082
         self.assertEqual([p["album"] for p in out], ["menu", "menu", "food", "food", "food"])
         self.assertTrue(all(p["keep"] for p in out))
         self.assertFalse(any("predefineAlbumId=1" in x or "predefineAlbumId=4" in x for x in c.calls))  # never fetched
+
+    def test_first_gallery_request_is_page_zero(self):  # #1081 root cause: foody.vn pageIndex is 0-based
+        c = FakeClient({2: gallery_rows(2, 7)})
+        out = ff.photos(c, 1000000511, "/x", 5, expected={"2": 7})
+        self.assertEqual(len(out), 5)
+        first = [x for x in c.calls if "ListRestaurantPicturesWithPaging" in x][0]
+        self.assertIn("pageIndex=0&", first)
+        self.assertFalse(any("pageIndex=1&" in x for x in c.calls))  # fewer than 20 rows: one page only
+
+    def test_second_page_is_index_one(self):
+        c = FakeClient({3: gallery_rows(3, 25)})
+        out = ff.photos(c, 1, "/x", 25, expected={"3": 25})
+        self.assertEqual(len([p for p in out if p["album"] == "menu"]), min(25, len(out)))
+        pages = [int(__import__("re").search(r"pageIndex=(\d+)", x).group(1)) for x in c.calls if "predefineAlbumId=3" in x]
+        self.assertEqual(pages[:2], [0, 1])
 
     def test_menu_alone_fills_the_cap(self):
         c = FakeClient({3: gallery_rows(3, 40), 2: gallery_rows(2, 5)})
