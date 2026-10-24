@@ -19,7 +19,12 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 |---|---|---|
 | `AQD_FOODY_LIMIT` | số quán lấy mỗi lần chạy, `0` = chạy hết (hết danh sách thì nghỉ 10 phút rồi quét lại) | `20` |
 | `AQD_FOODY_DELAY` | giây giữa 2 request tới Foody | `2` |
-| `AQD_FOODY_MAX_PHOTOS` | ảnh tối đa / quán | `30` |
+| `AQD_FOODY_MAX_PHOTOS` | ảnh tối đa / quán, **chỉ** ảnh thực đơn rồi ảnh món (an_uong_quanh_day#1082) | `5` |
+| `AQD_MAX_REVIEWS` | review tối đa / quán, lật trang review đến khi đủ hoặc hết (#1083) | `50` |
+| `AQD_FOODY_LIST_RETRIES` / `AQD_FOODY_LIST_BACKOFF` / `AQD_FOODY_LIST_BACKOFF_MAX` | trang danh sách trống: số lần thử lại, giây chờ đầu (gấp đôi mỗi lần), trần (#1080) | `5` / `30` / `600` |
+| `AQD_FOODY_LIST_SKIP_STREAK` / `AQD_FOODY_LIST_SKIP_PAUSE` | bỏ qua liền ngần này trang thì nghỉ ngần này giây (#1080) | `5` / `1800` |
+| `AQD_FOODY_GALLERY_TRIES` / `AQD_FOODY_GALLERY_BACKOFF` / `AQD_FOODY_GALLERY_BACKOFF_MAX` | album ảnh lỗi: số lần thử lại, giây chờ đầu, trần (#1081) | `5` / `900` / `21600` |
+| `AQD_FOODY_GALLERY_RETRY_PER_PAGE` | số quán chờ thử lại ảnh xử lý trước mỗi trang danh sách (#1081) | `3` |
 | `AQD_FOODY_ROOT` | thư mục cài | `~/script_foody`, `C:\script_foody` |
 
 Dừng: tạo file `foody_data/STOP`. Log: `foody_data/fetch.log`.
@@ -52,12 +57,12 @@ Mỗi quán → `foody_data/<foody_id>/place.json`:
 - `source=foody`, `source_id`, `source_url`, `fetched_at`
 - tên, địa chỉ, quận, khu vực, toạ độ `lat/lng`, SĐT (`phones`), website, giá min/max
 - loại hình (`categories`), ẩm thực (`cuisines`), đối tượng khách
-- điểm Foody (thang 10), số bình luận, điểm từng tiêu chí, 2 bình luận mẫu
+- điểm Foody (thang 10), số bình luận, điểm từng tiêu chí, tối đa `AQD_MAX_REVIEWS` (50) bình luận mới nhất (khoá `reviews_sample`)
 - giờ mở cửa từng ngày (`opening_hours`) + `opening_periods` `{weekday 1=T2..7=CN, opens_at, closes_at}` (giống script_google_map)
 - menu công khai (trang `/thuc-don`, nếu quán có)
-- ảnh: album Thực đơn → Món ăn → Không gian → Tổng hợp; mỗi ảnh có `source_id` (id ảnh Foody), `source_url`, `album`, `keep`. Ảnh `keep` lưu ở `photos/`.
+- ảnh: **chỉ** album Thực đơn rồi Món ăn (đồ ăn/đồ uống), tổng tối đa `AQD_FOODY_MAX_PHOTOS` (5); mỗi ảnh có `source_id` (id ảnh Foody), `source_url`, `album`, `keep`. Lưu ở `photos/`.
 
-Luật ảnh (#855): **không còn model local**. Mọi ảnh của album Thực đơn / Món ăn / Không gian được upload, API tự phân loại (ảnh khó → `unclassified` cho admin; chỉ ảnh menu đi vào flow đọc menu). Album “Tổng hợp” chưa upload vì API import chưa nhận ảnh không có `role`.
+Luật ảnh (an_uong_quanh_day#1082, thay luật #855): chỉ lấy ảnh **thực đơn trước**, rồi lấp bằng ảnh **món ăn/đồ uống**, tổng tối đa 5/quán. Không lấy ảnh không gian, người, “Tổng hợp”. Không có model local; API vẫn tự phân loại ảnh đã upload.
 
 Lịch sự với Foody: ≥2 s/request + ngẫu nhiên, gặp 429/403/“System Busy” thì chờ 30 s → 10 phút; lỗi 3 lần thì bỏ quán.
 
@@ -69,3 +74,33 @@ Lịch sự với Foody: ≥2 s/request + ngẫu nhiên, gặp 429/403/“System
 Chỉ dùng endpoint import mới: truonglh2372/an_uong_quanh_day#683 (chống trùng + cờ `duplicate` trỏ tới quán bị trùng) và #682 (cột nguồn). Xem quán Foody trên tab admin «Nguồn Foody» (#686). Endpoint chưa có thì `--apply` dừng, không gửi gì. Đăng nhập admin dùng `common/aqd_api.py` như script_google_map (`creds.env` / `.aqd_session`, không commit).
 
 Dữ liệu Foody xoá thủ công từ tab admin «Nguồn Foody» (truonglh2372/an_uong_quanh_day#686).
+
+## Danh sách trống, album ảnh lỗi, review (an_uong_quanh_day#1080, #1081, #1083)
+- **Danh sách (#1080):** trang trống hoặc không có `Total` mà vẫn **dưới** tổng đã biết (`_state.json` `total`) = Foody đang chặn, không phải hết danh sách: thử lại đúng trang đó với backoff, hết lượt thì bỏ qua sang trang sau (ghi `skipped_pages`). Chỉ quay về trang 1 khi đã qua tổng đã biết. Trang đang cào luôn được lưu vào `_state.json`.
+- **Album ảnh lỗi (#1081):** album thực đơn/món ăn trả 503/«System Busy»/không phải JSON, hoặc trả rỗng trong khi trang quán nói có ảnh → quán **không** được đánh dấu xong, vào hàng `gallery_retry` của `_state.json` (thử lại sau 15 phút, 30, 60... tối đa 6 giờ). Hết 5 lượt thì sang `gallery_failed`, vẫn chưa xong nên vòng danh sách sau lấy lại.
+- **Review (#1083):** lật `/__get/Review/ResLoadMore` (10/lần, mới nhất trước) đến khi đủ `AQD_MAX_REVIEWS` hoặc hết; trang review lỗi thì giữ phần đã đọc, không chặn quán. Pusher gửi review theo lô 20. Không tự lấy lại review cho quán cũ.
+- Test offline: `python3 tests/test_list_and_gallery.py`.
+
+## Lấy lại ảnh cho quán đã lên với 0 ảnh (an_uong_quanh_day#1081) — CHUẨN BỊ SẴN, CHƯA CHẠY
+Trước #1081, quán có album ảnh lỗi vẫn bị đánh dấu xong và lên server **không có ảnh**. `scripts/replay_missing_photos.py` đưa các quán đó vào hàng `gallery_retry` để chính crawler lấy lại (đúng luật #1082: thực đơn trước, rồi món, tối đa 5) và pusher chỉ gửi ảnh còn thiếu vào **nhà hàng đã có** (không tạo quán mới).
+
+Danh sách id (ảnh chụp lúc 2026-10-24 20:48 ICT, tab: `foody_id restaurant_id ảnh_thực_đơn ảnh_món tổng_ảnh`):
+| File | Máy | Số quán |
+|---|---|---|
+| `scripts/replay_ids/foody_mac.tsv` | Mac (`~/script_foody/foody_data`) | 353 |
+| `scripts/replay_ids/foody_admin.tsv` | Admin (`C:\script_foody\foody_data`) | 336 |
+
+(Không tính 167 + 128 quán chỉ có ảnh không gian/“Tổng hợp”: theo luật #1082 không lấy nữa.)
+
+Chạy trên **đúng máy** của danh sách, bằng python của `.venv`:
+```bash
+# 1. (tuỳ chọn) dựng lại danh sách từ dữ liệu hiện tại — chỉ đọc
+python scripts/replay_missing_photos.py list --out scripts/replay_ids/foody_mac.tsv
+# 2. chạy thử (mặc định): in ra sẽ xếp hàng bao nhiêu quán, không ghi gì
+python scripts/replay_missing_photos.py enqueue --ids-file scripts/replay_ids/foody_mac.tsv
+# 3. thật: DỪNG crawler trước (tạo foody_data/STOP, chờ tiến trình thoát, xoá STOP), rồi
+python scripts/replay_missing_photos.py enqueue --ids-file scripts/replay_ids/foody_mac.tsv --apply [--limit 50]
+# 4. khởi động lại crawler như thường; mỗi trang danh sách nó xử lý AQD_FOODY_GALLERY_RETRY_PER_PAGE quán trong hàng
+```
+`--apply` từ chối nếu `foody_fetch.py` đang chạy hoặc `_state.json` vừa đổi trong 120 giây, và lưu bản sao `_state.json.pre-replay-<giờ>` trước khi ghi. Hoàn tác: dừng crawler, chép bản sao đó đè lại `_state.json`.
+Test offline: `python3 tests/test_replay_missing_photos.py`.
