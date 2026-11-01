@@ -10,14 +10,19 @@ Endpoint thật (an_uong_quanh_day: app/controllers/api/v1/admin/import_restaura
       Nghi trùng quán khác: server tạo quán draft, gắn cờ 'duplicate' + duplicate candidate để admin duyệt.
   POST /v1/admin/imports/restaurants/:id/photos  multipart image + source, source_id, source_url, role
                                                  (food|drink|menu|interior|storefront_or_sign); gửi lại = trả ảnh cũ.
-Review Foody: server CHƯA có endpoint nhận review Foody (#682/#683 không có), nên review chỉ ghi vào
-foody_data/_reviews_pending.jsonl (source='foody', source_id), không gửi.
+  POST /v1/admin/imports/restaurants/:id/reviews {reviews:[{source, source_id, source_url, author_name,
+                                                 rating_original(0-10), text, published_at(ISO 8601)}]} (#736)
+                                                 -> foody_push.Pusher.push_reviews (tối đa AQD_MAX_REVIEWS=50/quán).
+Script này (foody_upload.py) chỉ ghi review vào foody_data/_reviews_pending.jsonl; gửi review do foody_push lo.
+Server CHƯA nhận (không gửi, ghi trong PR #7 là việc phía server): price_min/max, điểm Foody + số đánh giá,
+điểm thành phần, mô tả quán, tiêu đề review.
 
   python common/foody_upload.py                     # dry-run: kiểm tra payload, ghi foody_data/_upload_preview.jsonl
   python common/foody_upload.py --apply             # gửi thật
   python common/foody_upload.py --apply --ids 30086 44253
 """
-import argparse, json, os, sys
+import argparse, json, os, re, sys
+from datetime import datetime, timezone
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -45,9 +50,42 @@ def _mins(t):
     return int(h) * 60 + int(m)
 
 
+# Foody chia ca qua đêm thành 2 mảnh: ca tối ngày D kết thúc 23:59 và một ca "00:05-01:00" (cũng gắn vào MỌI ngày).
+# Mảnh sáng sớm đó là phần đuôi của ca tối hôm trước, không phải một ca mới (issue #7 mục 6, quán 97063).
+TAIL_START_MAX = 15          # ca bắt đầu trong 00:00..00:15 ...
+LATE_END_MIN = 23 * 60 + 45  # ... nối vào ca của ngày trước kết thúc từ 23:45 (hoặc 24:00)
+
+
+def _stitch_overnight(per):
+    """Gộp mảnh đuôi sau nửa đêm vào ca tối của ngày hôm trước. Mảnh không có ca tối hôm trước để nối thì giữ nguyên."""
+    rows = []
+    for x in per:
+        try:
+            a, b = _mins(x["opens_at"]), _mins(x["closes_at"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            rows.append(dict(x)); continue
+        rows.append({**x, "_a": a, "_b": b})
+    by_day = {}
+    for r in rows:
+        by_day.setdefault(r["weekday"], []).append(r)
+    drop = set()
+    for wd, items in by_day.items():
+        prev = by_day.get(7 if wd == 1 else wd - 1) or []
+        for t in items:
+            if "_a" not in t or t["_a"] > TAIL_START_MAX or t["_b"] <= t["_a"] or t["_b"] >= 12 * 60:
+                continue
+            late = [p for p in prev if "_a" in p and p["_a"] > t["_b"] and (p["_b"] >= LATE_END_MIN or p["_b"] == 0)]
+            if not late:
+                continue
+            late[0]["closes_at"] = t["closes_at"]
+            drop.add(id(t))
+    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows if id(r) not in drop]
+
+
 def clean_periods(per):
     """Foody hay có ca trùng/lồng nhau hoặc ca 0 phút (00:00-00:00) -> server trả 422 opening_periods_invalid.
     Bỏ ca 0 phút, gộp các ca chồng nhau trong cùng ngày (ca qua đêm: closes < opens tính +24h)."""
+    per = _stitch_overnight(per)
     out = []
     for wd in range(1, 8):
         iv = []
@@ -76,6 +114,41 @@ def clean_periods(per):
     return out
 
 
+VN_MOBILE = re.compile(r"^0[35789]\d{8}$")
+VN_LANDLINE = re.compile(r"^02\d{9}$")
+VN_HOTLINE = re.compile(r"^(1800|1900)\d{4,6}$")
+
+
+def normalize_vn_phone(raw):
+    """Một số VN -> dạng nội địa chỉ chữ số (0xxxxxxxxx / 02xxxxxxxxx / 1900xxxx). None nếu không phải số hợp lệ."""
+    d = re.sub(r"\D", "", str(raw or ""))
+    if d.startswith("0084"):
+        d = d[4:]
+    if d.startswith("84") and len(d) in (11, 12):
+        d = d[2:]
+    if d and not d.startswith(("0", "1")):
+        d = "0" + d
+    if VN_MOBILE.match(d) or VN_LANDLINE.match(d) or VN_HOTLINE.match(d):
+        return d
+    return None
+
+
+def phones_of(p):
+    """#7 mục 2: gộp phones (XHR RestaurantPhone, hay trả rỗng) + phone (initData) + list_phone (danh sách Foody,
+    vd "0982 436 061 - (028) 2224 0361", "Đang cập nhật" = không có), chuẩn hoá, bỏ trùng, giữ thứ tự."""
+    raw = []
+    for v in (p.get("phones") or [], p.get("phone"), p.get("list_phone")):
+        for item in (v if isinstance(v, list) else [v]):
+            if item:
+                raw += re.split(r"\s+-\s+|[,;/|]|\s+(?:hoặc|or)\s+", str(item))
+    out = []
+    for r in raw:
+        n = normalize_vn_phone(r)
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
 def payload(p):
     menu = []
     for m in p.get("menu") or []:
@@ -91,7 +164,7 @@ def payload(p):
     body = {"source": "foody", "source_id": str(p["source_id"]), "source_url": p.get("source_url"),
             "name": p.get("name"), "address": p.get("address_full") or p.get("address"),
             "district": p.get("district"), "city": p.get("city"), "lat": p.get("lat"), "lng": p.get("lng"),
-            "website": p.get("website"), "phones": p.get("phones") or [],
+            "website": p.get("website"), "phones": phones_of(p),
             "cuisines": p.get("cuisines") or [], "categories": p.get("categories") or [],
             "opening_periods": per, "menu": menu}
     return {k: v for k, v in body.items() if v is not None}
@@ -107,20 +180,54 @@ def problems(b):
     return out
 
 
+MAX_REVIEWS = int(os.environ.get("AQD_MAX_REVIEWS", "50"))
+
+
+def iso_time(v):
+    """Ngày review -> ISO 8601 cho published_at của server (Time.iso8601). Nhận ISO, /Date(ms)/, dd/mm/yyyy [HH:MM];
+    không đọc được thì None (gửi sai định dạng làm server trả 422 cho CẢ lô review)."""
+    if v in (None, ""):
+        return None
+    s_ = str(v).strip()
+    m = re.search(r"/Date\((-?\d+)", s_)
+    if m:
+        return datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).isoformat(timespec="seconds")
+    try:
+        d = datetime.fromisoformat(s_.replace("Z", "+00:00"))
+    except ValueError:
+        d = None
+        for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%m/%d/%Y %I:%M:%S %p"):
+            try:
+                d = datetime.strptime(s_, fmt); break
+            except ValueError:
+                pass
+        if d is None:
+            return None
+    if d.tzinfo is None:  # giờ Foody là giờ VN
+        from datetime import timedelta
+        d = d.replace(tzinfo=timezone(timedelta(hours=7)))
+    return d.isoformat(timespec="seconds")
+
+
 def reviews_of(p):
     out = []
     for x in p.get("reviews_sample") or []:
-        if not x.get("source_id"):
+        if not isinstance(x, dict) or not x.get("source_id"):
             continue  # không có id nguồn thì không bao giờ gửi (không lọc/xoá được)
         out.append({"source": "foody", "source_id": str(x["source_id"]), "source_url": x.get("source_url"),
                     "author_name": x.get("author"), "rating": x.get("rating"), "text": x.get("text"),
-                    "restaurant_source_id": str(p["source_id"]), "status": "pending_no_endpoint"})
+                    "title": x.get("title"), "created_at": x.get("created_at"),
+                    "restaurant_source_id": str(p["source_id"]), "status": "pending"})
+        if len(out) >= MAX_REVIEWS:
+            break
     return out
 
 
 def photos_of(p):
     out = []
     for x in p.get("photos") or []:
+        if not isinstance(x, dict):
+            continue
         role = ROLE_MAP.get(x.get("role") or "") or ROLE_MAP.get(x.get("album") or "")
         if x.get("keep") and x.get("file") and x.get("source_id") and role:
             out.append({**x, "_role": role})
