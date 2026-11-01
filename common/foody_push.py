@@ -8,7 +8,7 @@ Dùng chung logic payload/photos_of/reviews_of của foody_upload.py (v1 import 
   (hoặc duplicate_of_id). Giữ place.json, _state.json, _uploaded.json, _reviews_pending.jsonl.
 - Lỗi upload: giữ file, lần lặp/khởi động sau thử lại.
 """
-import json, os, sys, threading, time, queue, shutil
+import argparse, json, os, sys, threading, time, traceback, queue, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 if not os.environ.get("AQD_ROOT"):
@@ -100,6 +100,8 @@ class Pusher:
         rec = self.done.get(fid) or {}
         if not rec.get("restaurant_id"):
             r = self.api.call("POST", EP, json_body=body)
+            if not isinstance(r, dict) or not r.get("restaurant_id"):
+                raise RuntimeError(f"import trả về không có restaurant_id: {str(r)[:200]}")
             cands = (r.get("duplicate") or {}).get("candidates") or []
             rec = {"restaurant_id": r["restaurant_id"], "created": r.get("created"),
                    "duplicate_suspected": bool((r.get("duplicate") or {}).get("suspected")),
@@ -140,7 +142,10 @@ class Pusher:
         ok, pg = set(), 1
         while want:
             r = self.api.call("GET", f"/v1/admin/restaurants/{rec['restaurant_id']}/photos?per_page=100&page={pg}")
+            r = r if isinstance(r, dict) else {}
             for x in r.get("photos") or []:
+                if not isinstance(x, dict):
+                    continue  # id/chuỗi thay vì object: không xác nhận được -> coi như chưa xong
                 if x.get("import_source") == "foody" and (x.get("status") == "succeeded" or x.get("duplicate_of_id")):
                     ok.add(str(x.get("source_id")))
             if not r.get("has_more"):
@@ -168,10 +173,12 @@ class Pusher:
                 continue
             if not 0 <= ro <= 10:
                 continue
-            row = {"source": "foody", "source_id": r["source_id"], "source_url": r.get("source_url"),
-                   "author_name": r.get("author_name"), "rating_original": ro, "text": r.get("text") or ""}
+            # #7 mục 4: published_at (server: source_created_at, ISO 8601). Tiêu đề: server CHƯA có field -> không gửi.
+            row = {"source": "foody", "source_id": r["source_id"], "source_url": r.get("source_url") or None,
+                   "author_name": r.get("author_name"), "rating_original": ro, "text": r.get("text") or "",
+                   "published_at": fu.iso_time(r.get("created_at"))}
             rows.append({k: v for k, v in row.items() if v is not None})
-        return rows
+        return rows[:fu.MAX_REVIEWS]
 
     def push_reviews(self, fid, p=None):
         """Đẩy review của quán đã import; idempotent (server upsert theo source+source_id, local _reviews_pushed.json)."""
@@ -203,7 +210,8 @@ class Pusher:
             return True
         except Exception as e:
             self.stats["fail"] += 1
-            print(f"  [push ✗] #{fid}: {type(e).__name__} {getattr(e, 'status', '')} {str(e)[:200]}", flush=True)
+            print(f"  [push ✗] #{fid}: {type(e).__name__} {getattr(e, 'status', '')} {str(e)[:300]}\n"
+                  + "".join("    " + ln for ln in traceback.format_exc().splitlines(True)), flush=True)
             return False
 
     def backlog(self):
@@ -246,3 +254,68 @@ class Pusher:
         for b in self.backlog():
             self.q.put(b)
         self.q.put("__STOP__")
+
+
+# ---- #7 mục 7: đẩy bù cho quán ĐÃ tạo (có restaurant_id trong _uploaded.json), không tạo lại quán ----
+def backfill_ids(done, ids=None):
+    return [f for f in (ids or sorted(done)) if (done.get(f) or {}).get("restaurant_id")]
+
+
+def backfill(pusher, ids=None, apply=False, out=print):
+    """Với mỗi quán đã có restaurant_id:
+    1. gửi lại payload import (server tìm theo source+source_id -> created=false, chỉ ĐIỀN field đang trống như phone;
+       không tạo quán mới, không đổi menu/giờ đã có). restaurant_id trả về khác bản ghi -> dừng quán đó, không ghi đè.
+    2. gửi review còn thiếu (chưa có trong _reviews_pushed.json), tối đa AQD_MAX_REVIEWS.
+    3. dọn ảnh local nếu server đã lưu đủ (cleanup như thường).
+    Mặc định dry-run: chỉ in việc sẽ làm, không gọi server."""
+    st = {"places": 0, "refilled": 0, "reviews": 0, "fail": 0, "mismatch": 0}
+    for fid in backfill_ids(pusher.done, ids):
+        rec = pusher.done[fid]; rid = rec["restaurant_id"]; p = load_place(fid)
+        if p is None:
+            continue
+        st["places"] += 1
+        body = fu.payload(p)
+        sent = set(pusher.rpushed.get(fid) or [])
+        todo = [r for r in pusher.review_rows(p) if r["source_id"] not in sent]
+        if not apply:
+            out(f"[dry] #{fid} -> quán {rid} | phones {body.get('phones')} | {len(todo)} review sẽ gửi")
+            st["reviews"] += len(todo); continue
+        try:
+            if not fu.problems(body):
+                r = pusher.api.call("POST", EP, json_body=body)
+                got = r.get("restaurant_id") if isinstance(r, dict) else None
+                if str(got) != str(rid):
+                    st["mismatch"] += 1
+                    out(f"[backfill ✗] #{fid}: server trả quán {got}, bản ghi là {rid} -> bỏ qua, cần admin xem"); continue
+                st["refilled"] += 1
+            n0 = pusher.stats["reviews"]
+            pusher.push_reviews(fid, p)
+            st["reviews"] += pusher.stats["reviews"] - n0
+            pusher.cleanup(fid)
+            out(f"[backfill ✓] #{fid} -> quán {rid} | +{pusher.stats['reviews'] - n0} review")
+        except Exception as e:
+            st["fail"] += 1
+            out(f"[backfill ✗] #{fid}: {type(e).__name__} {str(e)[:300]}\n" + traceback.format_exc())
+    return st
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Đẩy bù review/field cho quán Foody đã tạo (không tạo lại quán)")
+    ap.add_argument("--backfill", action="store_true", required=True)
+    ap.add_argument("--ids", nargs="*", help="Foody id; mặc định mọi quán có restaurant_id trong _uploaded.json")
+    ap.add_argument("--apply", action="store_true", help="gửi thật (mặc định dry-run)")
+    a = ap.parse_args(argv)
+    if a.apply:
+        pusher = Pusher()
+    else:
+        pusher = Pusher.__new__(Pusher)
+        pusher.done = _read(UP, {}); pusher.cleaned = _read(CL, {}); pusher.rpushed = _read(RP, {})
+        pusher.stats = {"reviews": 0}
+    st = backfill(pusher, a.ids, apply=a.apply)
+    print("TỔNG", json.dumps(st, ensure_ascii=False))
+    if not a.apply:
+        print("DRY-RUN: không gửi gì lên server. Thêm --apply để gửi thật.")
+
+
+if __name__ == "__main__":
+    main()

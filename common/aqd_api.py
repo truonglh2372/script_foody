@@ -99,6 +99,23 @@ class APIError(AQDError):
                                                            if details else ""))
 
 
+def error_fields(body, fallback=None):
+    """(code, details) from an error response body. The API answers {"error": {"code", "details"}}, but Rails' own
+    404/500 pages answer {"status": 404, "error": "Not Found"} (error as a STRING) and proxies may answer a list or
+    HTML; calling .get on those hid the real HTTP error behind AttributeError (script_foody#7)."""
+    if not isinstance(body, dict):
+        return fallback, None
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err.get("code") or fallback, err.get("details")
+    if isinstance(err, str) and err.strip():
+        return err.strip(), ({"exception": body["exception"][:300]} if isinstance(body.get("exception"), str) else None)
+    errs = body.get("errors")
+    if errs:
+        return fallback, {"errors": errs}
+    return fallback, None
+
+
 def _now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -235,7 +252,7 @@ class TokenStore:
                 pass  # role checked server-side on each admin call (403 forbidden)
             return data
         try:
-            code = r.json().get("error", {}).get("code")
+            code = error_fields(r.json(), None)[0]
         except ValueError:
             code = None
         if r.status_code == 429:
@@ -315,8 +332,8 @@ class AQD:
                 body["_status"] = r.status_code
                 return body
             if r.status_code >= 400:
-                err = (body or {}).get("error", {}) if isinstance(body, dict) else {}
-                raise APIError(r.status_code, err.get("code") or r.reason, err.get("details"), f"{method} {path}")
+                code, details = error_fields(body, r.reason)
+                raise APIError(r.status_code, code, details, f"{method} {path}")
             return body
 
     # ---------- read ----------

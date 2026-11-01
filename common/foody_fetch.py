@@ -209,19 +209,36 @@ def phone(c, fid, ref):
     return sorted({re.sub(r"\D", "", n) for n in nums if 9 <= len(re.sub(r"\D", "", n)) <= 12})
 
 
+def parse_int_menu(text):
+    """window.intMenu = {...} -> dict. Đọc bằng JSONDecoder.raw_decode từ dấu { đầu tiên nên không phụ thuộc vào
+    ký tự sau object (regex cũ đòi `};` + xuống dòng: trang gộp/minify `};</script>` hoặc `}; window.x=` -> menu rỗng,
+    #7 mục 5). None nếu không có hoặc không phải JSON."""
+    m = re.search(r"window\.intMenu\s*=\s*", text or "")
+    if not m:
+        return None
+    try:
+        d, _ = json.JSONDecoder().raw_decode(text, m.end())
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
 def menu(c, fid, ref, cap=500):
     """Menu công khai: JSON window.intMenu trong trang /thuc-don (nhóm -> Dishes)."""
     r = c.get(ref + "/thuc-don", referer=ref)
     if r is None:
         return []
-    m = re.search(r"window\.intMenu\s*=\s*(\{.*?\});\s*\n", r.text, re.S)
-    try:
-        d = json.loads(m.group(1)) if m else {}
-    except ValueError:
+    d = parse_int_menu(r.text)
+    if d is None:
+        print(f"  ! menu #{fid}: trang /thuc-don không có window.intMenu đọc được ({len(r.text)} byte)", flush=True)
         d = {}
     items = []
-    for grp in d.get("MenuItems") or []:
-        for x in grp.get("Dishes") or []:
+    for grp in d.get("MenuItems") or d.get("Categories") or d.get("Groups") or []:
+        if not isinstance(grp, dict):
+            continue
+        for x in grp.get("Dishes") or grp.get("Items") or []:
+            if not isinstance(x, dict):
+                continue
             items.append({"name": x.get("Name"), "price": x.get("Price"), "category": grp.get("Name"),
                           "description": x.get("Description"),
                           "photo_url": x.get("ImageUrl") or x.get("ImageThumbUrl") or x.get("RepresentImg")})
