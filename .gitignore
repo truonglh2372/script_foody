@@ -7,3 +7,7 @@ creds.env
 
 # stray Windows-path artefacts from aqd_api defaults run on macOS
 C:/
+
+slack_webhook*
+slack_state.json*
+watchdog_state.json

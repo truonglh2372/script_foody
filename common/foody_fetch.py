@@ -62,13 +62,13 @@ GALLERY_BACKOFF_MAX = float(os.environ.get("AQD_FOODY_GALLERY_BACKOFF_MAX", "216
 GALLERY_RETRY_PER_PAGE = int(os.environ.get("AQD_FOODY_GALLERY_RETRY_PER_PAGE", "3"))  # retries done before each list page
 
 
-def _make_heartbeat():
-    """Crawler heartbeat for the daily Slack ops report (an_uong_quanh_day#1021). Token: env AQD_INGEST_TOKEN or the
-    AQD_INGEST_TOKEN line of <AQD_ROOT>/creds.env; none -> no-op. Best effort, never stops the crawl."""
+def _make_notifier():
+    """Slack status reports straight from the crawler (an_uong_quanh_day#1388): webhook from env
+    SLACK_CRAWLER_WEBHOOK_URL or the local secret file (see README); none -> logs one warning, never stops the crawl."""
     try:
-        import heartbeat
-        aqd_root = os.environ.get("AQD_ROOT") or ("C:/aqd" if os.name == "nt" else os.path.expanduser("~/aqd"))
-        return heartbeat.Heartbeat("script_foody", ROOT, env_file=os.path.join(aqd_root, "creds.env"))
+        import slack_notify
+        return slack_notify.Notifier("foody", ROOT,
+                                     version=slack_notify.git_version(os.path.dirname(os.path.abspath(__file__))))
     except Exception:
         return None
 
@@ -119,7 +119,8 @@ class Client:
                 not raw and "text/html" in r.headers.get("content-type", "") and "System Busy" in r.text[:600])
             if busy:
                 print(f"  ! {r.status_code} busy {url} -> chờ {back}s", flush=True)
-                hb("note", "rate_limited", f"Foody {r.status_code} busy, backoff {back}s")
+                hb("error", "http_503" if r.status_code == 503 else "rate_limited",
+                   f"Foody {r.status_code} busy, chờ {back}s")
                 time.sleep(back); back = min(back * 2, 600); continue
             if r.status_code == 404:
                 return None
@@ -526,12 +527,12 @@ def process_item(c, it, a, st, pusher, retry=False):
         when = (f"thử lại sau {int(ent['next_at'] - time.time())}s" if "next_at" in ent
                 else "hết lượt, chờ vòng danh sách sau")
         print(f"  ↻ #{fid}: {e} -> CHƯA xong, {when} (lần {ent['tries']}/{GALLERY_TRIES})", flush=True)
-        hb("record_place", False); hb("note", "rate_limited", f"#{fid}: {str(e)[:120]}")
+        hb("record_place", False); hb("error", "rate_limited", f"#{fid}: {str(e)[:120]}")
         return "gallery"
     except Exception as e:
         st["failed"][fid] = st["failed"].get(fid, 0) + 1
         print(f"  ✗ #{fid}: {e}", flush=True)
-        hb("record_place", False); hb("note", None, f"#{fid}: {type(e).__name__}: {str(e)[:120]}")
+        hb("record_place", False)
         if st["failed"][fid] >= 3:
             st["done"][fid] = "skip-3-fails"
         return "error"
@@ -555,7 +556,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
     global HB
-    HB = _make_heartbeat()
+    HB = _make_notifier()
     stp = os.path.join(ROOT, "_state.json")
     try:
         st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
@@ -570,16 +571,36 @@ def main(argv=None):
     page = a.start_page or st.get("page", 1)
     c, n = Client(), 0
     print(f"parity={a.parity} page={page} known_total={st.get('total')}", flush=True)
+    hb("position", _where(page, a.parity, st))
+    hb("start", "foody_fetch.py " + " ".join(sys.argv[1:] if argv is None else argv))
+    if pusher:  # reviews / uploads come from the pusher thread's running totals
+        hb("track_totals", lambda: {"reviews": pusher.stats["reviews"], "upload_ok": pusher.stats["pushed"],
+                                    "upload_fail": pusher.stats["fail"]})
+    hb("install_crash_hook")
+    hb("start_timer")
+    try:
+        n = _crawl(a, st, stp, pusher, c, page)
+    except KeyboardInterrupt:
+        hb("stop", "Ctrl+C"); raise
+    hb("stop", "thấy file STOP" if os.path.exists(os.path.join(ROOT, "STOP")) else f"xong {n} quán")
+    print(f"xong: {n} quán")
+
+
+def _where(page, parity, st):
+    total = st.get("total")
+    return f"foody page {page}, parity {parity}" + (f" (tổng list {int(total):,})".replace(",", ".") if total else "")
+
+
+def _crawl(a, st, stp, pusher, c, page):
+    n = 0
     while a.limit == 0 or n < a.limit:
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
             if pusher: pusher.drain_and_stop(); pusher.t.join()
-            hb("beat", "dừng (STOP)", status="idle", force=True)
             break
         if pusher and free_gb() < a.min_free_gb:
             print(f"ổ còn {free_gb():.1f} GB < {a.min_free_gb} GB -> tạm ngừng cào 5 phút, uploader đang xoá ảnh đã lên", flush=True)
-            hb("note", "disk_full", f"disk {free_gb():.1f} GB < {a.min_free_gb} GB")
-            hb("beat", "tạm ngừng: ổ đầy", status="blocked", force=True)
+            hb("error", "disk_low", f"Ổ đĩa còn {free_gb():.1f} GB (< {a.min_free_gb:g} GB) → tạm ngừng cào")
             time.sleep(300); continue
         for fid in due_gallery_retries(st):  # #1081: places whose gallery failed earlier
             ent = st["gallery_retry"][fid]
@@ -592,19 +613,18 @@ def main(argv=None):
         if not items:
             action, nxt, wait = plan_empty_page(st, page, total)
             if action == "end":
-                hb("beat", "hết danh sách, nghỉ 10 phút", status="idle")
                 print(f"hết danh sách (trang {page} > tổng {st.get('total')}), nghỉ {int(wait // 60)} phút rồi quét lại từ trang 1", flush=True)
             elif action == "retry":
-                hb("note", "rate_limited", f"Foody list page {page} empty (Total {total}); retry {st['list_retry']}/{LIST_RETRIES}")
                 print(f"trang {page} trống/không có tổng (đã biết tổng {st.get('total')}) -> thử lại sau {int(wait)}s "
                       f"(lần {st['list_retry']}/{LIST_RETRIES}), KHÔNG quay về trang 1", flush=True)
             else:
+                hb("empty_page", str(page))
                 print(f"trang {page} vẫn trống sau {LIST_RETRIES} lần -> bỏ qua, sang trang {nxt}"
                       + (f"; nhiều trang liền bị bỏ, nghỉ {int(wait // 60)} phút" if wait else ""), flush=True)
-            page = nxt; st["page"] = page; _save_state(st, stp)
+            page = nxt; st["page"] = page; _save_state(st, stp); hb("position", _where(page, a.parity, st))
             if wait: time.sleep(wait)
             continue
-        note_page_ok(st, total)
+        note_page_ok(st, total); hb("page_ok")
         for it in items:
             if a.limit and n >= a.limit:
                 break
@@ -618,10 +638,9 @@ def main(argv=None):
             if process_item(c, it, a, st, pusher) in ("ok", "none"):
                 n += 1
             _save_state(st, stp)
-            hb("beat", f"trang {page}: #{fid}", range_label=f"trang {page}")
         page += 1; st["page"] = page
-        _save_state(st, stp)
-    print(f"xong: {n} quán")
+        _save_state(st, stp); hb("position", _where(page, a.parity, st))
+    return n
 
 
 def _save_state(st, stp):
