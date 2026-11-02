@@ -592,6 +592,8 @@ def _where(page, parity, st):
 
 
 def _crawl(a, st, stp, pusher, c, page):
+    if pusher:
+        from foody_push import free_gb  # imported in main() too, but that name is local there (NameError since #9)
     n = 0
     while a.limit == 0 or n < a.limit:
         if os.path.exists(os.path.join(ROOT, "STOP")):
