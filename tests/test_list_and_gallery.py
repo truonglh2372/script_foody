@@ -120,12 +120,40 @@ class ListPaging(unittest.TestCase):  # #1080
             return [], None
 
         with mock.patch.object(ff, "ROOT", root), mock.patch.object(ff, "list_page", fake_list), \
-                mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_heartbeat", lambda: None):
+                mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_notifier", lambda: None):
             ff.main(["--limit", "0", "--no-push"])
         self.assertEqual(calls, [120, 120])
         with open(stp) as f:
             self.assertEqual(json.load(f)["page"], 120)
 
+
+    def test_main_reports_start_empty_pages_and_stop_to_slack(self):
+        """#1388: start + 10 empty pages in a row (severe) + stop on STOP, all through the notifier (fake sender)."""
+        import slack_notify
+        root = tempfile.mkdtemp(prefix="foody_slack_")
+        json.dump({"page": 531, "done": {}, "failed": {}, "total": 37208}, open(os.path.join(root, "_state.json"), "w"))
+        sent, calls = [], []
+
+        def fake_list(c, page):
+            calls.append(page)
+            if len(calls) >= (ff.LIST_RETRIES + 1) * 10 + 1:
+                open(os.path.join(root, "STOP"), "w").close()
+            return [], 37208
+
+        env = {"SLACK_CRAWLER_WEBHOOK_URL": "http://127.0.0.1:9/x", "AQD_HOST_LABEL": "Admin",
+               "SLACK_CRAWLER_WEBHOOK_FILE": os.path.join(root, "none")}
+        make = lambda: slack_notify.Notifier("foody", root, env=env, sender=lambda u, p: sent.append(p["text"]) or True)
+        with mock.patch.object(ff, "ROOT", root), mock.patch.object(ff, "list_page", fake_list), \
+                mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_notifier", make), \
+                mock.patch.object(ff, "LIST_SKIP_STREAK", 99):
+            ff.main(["--limit", "0", "--no-push", "--parity", "even"])
+        self.assertTrue(sent[0].startswith("▶️ *foody @ Admin* — bắt đầu chạy"), sent[0])
+        self.assertIn("Tiếp tục từ: foody page 531, parity even (tổng list 37.208)", sent[0])
+        red = [x for x in sent if x.startswith("🔴")]
+        self.assertEqual(len(red), 1)
+        self.assertIn("10 trang list liên tiếp trả \"0 quán\" (531→540)", red[0])
+        self.assertTrue(sent[-1].startswith("⚫ *foody @ Admin* — đã dừng (thấy file STOP)"), sent[-1])
+        self.assertIn("Dừng tại: foody page 541, parity even", sent[-1])
 
 class Gallery(unittest.TestCase):  # #1081 + #1082
     def test_menu_first_then_dishes_max_five(self):
