@@ -53,6 +53,12 @@ LIST_BACKOFF_MAX = float(os.environ.get("AQD_FOODY_LIST_BACKOFF_MAX", "600"))
 LIST_SKIP_STREAK = int(os.environ.get("AQD_FOODY_LIST_SKIP_STREAK", "5"))     # this many skipped pages in a row ->
 LIST_SKIP_PAUSE = float(os.environ.get("AQD_FOODY_LIST_SKIP_PAUSE", "1800"))  # long pause (Foody is throttling)
 END_PAUSE = 600
+# Root cause of the endless "trang N: 0 quán": HomeListPlace returns at most LIST_CAP items per query (page*count
+# <= 2000: count=12 -> page 166 is the last non-empty page, count=50 -> 40, count=100 -> 20) while Total still says
+# 37208. Pages past the cap are ALWAYS empty. So the crawler treats min(Total, LIST_CAP) as the end of a query and
+# walks the city in slices (districtId, and districtId+cateId when a district alone is over the cap).
+LIST_CAP = int(os.environ.get("AQD_FOODY_LIST_CAP", "2000"))
+SLICE_MAX_ID = int(os.environ.get("AQD_FOODY_SLICE_MAX_ID", "80"))  # probe districtId / cateId 1..this
 
 # an_uong_quanh_day#1081: a gallery fetch that errors (503/busy, non-JSON, give-up) or comes back empty while the
 # album counts say there are photos must not mark the place done; it is queued in _state.json "gallery_retry".
@@ -139,9 +145,9 @@ class Client:
 
 
 # ---------- danh sách ----------
-def list_page(c, page, count=12):
+def list_page(c, page, count=12, district="", cate=""):
     q = (f"/__get/Place/HomeListPlace?t={int(time.time()*1000)}&page={page}&lat=10.823099&lon=106.629664"
-         f"&count={count}&districtId=&cateId=&cuisineId=&isReputation=&type=1")
+         f"&count={count}&districtId={district}&cateId={cate}&cuisineId=&isReputation=&type=1")
     d = c.json(q, referer=f"/{CITY}/o-dau") or {}
     return d.get("Items") or [], d.get("Total")
 
@@ -448,7 +454,7 @@ def plan_empty_page(st, page, total, page_size=PAGE_SIZE, retries=None, backoff=
     if isinstance(total, int) and total > 0:
         st["total"] = total
     known = st.get("total")
-    if not known or (page - 1) * page_size >= int(known):
+    if not known or (page - 1) * page_size >= min(int(known), LIST_CAP // page_size * page_size):  # count=12 -> 166 pages
         st["list_retry"] = 0; st["skip_streak"] = 0
         return "end", 1, END_PAUSE
     n = int(st.get("list_retry") or 0) + 1
@@ -463,6 +469,49 @@ def plan_empty_page(st, page, total, page_size=PAGE_SIZE, retries=None, backoff=
         return "skip", page + 1, LIST_SKIP_PAUSE
     st["skip_streak"] = streak
     return "skip", page + 1, 0
+
+
+def build_slices(total_of, cap=None, max_id=None):
+    """Slices of the city list that each fit under the API cap. total_of(district, cate) -> Total (int or None).
+    Districts under the cap are one slice; a district over it is split by every cateId seen city-wide."""
+    cap = LIST_CAP if cap is None else cap
+    max_id = SLICE_MAX_ID if max_id is None else max_id
+    cates = [k for k in range(1, max_id + 1) if (total_of("", k) or 0) > 0]
+    out = []
+    for d in range(1, max_id + 1):
+        t = total_of(d, "") or 0
+        if t <= 0:
+            continue
+        if t <= cap or not cates:
+            out.append({"district": d, "cate": "", "total": t})
+            continue
+        for k in cates:
+            tk = total_of(d, k) or 0
+            if tk > 0:
+                out.append({"district": d, "cate": k, "total": tk})
+    return out
+
+
+def slice_kw(st):
+    i = int(st.get("slice") or 0)
+    sl = st.get("slices") or []
+    if i <= 0 or i > len(sl):
+        return {}
+    return {"district": sl[i - 1]["district"], "cate": sl[i - 1]["cate"]}
+
+
+def next_slice(st, build):
+    """Called when the current query is exhausted. Returns True if a new slice starts (page 1, no pause),
+    False when the whole sweep is done (pause, then start over from the unfiltered list)."""
+    i = int(st.get("slice") or 0)
+    if i == 0:
+        st["slices"] = build()
+    st.pop("total", None)
+    if i + 1 <= len(st.get("slices") or []):
+        st["slice"] = i + 1
+        return True
+    st["slice"] = 0
+    return False
 
 
 def note_page_ok(st, total):
@@ -588,7 +637,10 @@ def main(argv=None):
 
 def _where(page, parity, st):
     total = st.get("total")
-    return f"foody page {page}, parity {parity}" + (f" (tổng list {int(total):,})".replace(",", ".") if total else "")
+    kw = slice_kw(st)
+    sl = (f" [lát {st.get('slice')}/{len(st.get('slices') or [])}: quận {kw['district']}"
+          + (f", loại {kw['cate']}" if kw["cate"] != "" else "") + "]") if kw else ""
+    return f"foody page {page}{sl}, parity {parity}" + (f" (tổng list {int(total):,})".replace(",", ".") if total else "")
 
 
 def _crawl(a, st, stp, pusher, c, page):
@@ -610,11 +662,17 @@ def _crawl(a, st, stp, pusher, c, page):
             if process_item(c, ent["item"], a, st, pusher, retry=True) == "ok":
                 n += 1
             _save_state(st, stp)
-        items, total = list_page(c, page)
-        print(f"trang {page}: {len(items)} quán (tổng {total})", flush=True)
+        kw = slice_kw(st)
+        items, total = list_page(c, page, **kw) if kw else list_page(c, page)
+        print(f"trang {page}{' ' + str(kw) if kw else ''}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
             action, nxt, wait = plan_empty_page(st, page, total)
-            if action == "end":
+            if action == "end" and next_slice(st, lambda: _build_slices_live(c)):
+                kw = slice_kw(st)
+                print(f"hết lát hiện tại (API chỉ trả tối đa {LIST_CAP} quán/lượt) -> sang lát {st['slice']}/"
+                      f"{len(st['slices'])} {kw}", flush=True)
+                wait = 0
+            elif action == "end":
                 print(f"hết danh sách (trang {page} > tổng {st.get('total')}), nghỉ {int(wait // 60)} phút rồi quét lại từ trang 1", flush=True)
             elif action == "retry":
                 print(f"trang {page} trống/không có tổng (đã biết tổng {st.get('total')}) -> thử lại sau {int(wait)}s "
@@ -643,6 +701,18 @@ def _crawl(a, st, stp, pusher, c, page):
         page += 1; st["page"] = page
         _save_state(st, stp); hb("position", _where(page, a.parity, st))
     return n
+
+
+def _build_slices_live(c):
+    def total_of(d, k):
+        try:
+            return list_page(c, 1, district=d, cate=k)[1]
+        except Exception:
+            return None
+    print(f"dựng danh sách lát (quận x loại, mỗi lát <= {LIST_CAP} quán)...", flush=True)
+    out = build_slices(total_of)
+    print(f"  {len(out)} lát, tổng {sum(x['total'] for x in out)} quán", flush=True)
+    return out
 
 
 def _save_state(st, stp):
