@@ -145,7 +145,7 @@ class ListPaging(unittest.TestCase):  # #1080
         make = lambda: slack_notify.Notifier("foody", root, env=env, sender=lambda u, p: sent.append(p["text"]) or True)
         with mock.patch.object(ff, "ROOT", root), mock.patch.object(ff, "list_page", fake_list), \
                 mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_notifier", make), \
-                mock.patch.object(ff, "LIST_SKIP_STREAK", 99):
+                mock.patch.object(ff, "LIST_SKIP_STREAK", 99), mock.patch.object(ff, "LIST_CAP", 10 ** 9):
             ff.main(["--limit", "0", "--no-push", "--parity", "even"])
         self.assertTrue(sent[0].startswith("▶️ *foody @ Admin* — bắt đầu chạy"), sent[0])
         self.assertIn("Tiếp tục từ: foody page 531, parity even (tổng list 37.208)", sent[0])
@@ -154,6 +154,46 @@ class ListPaging(unittest.TestCase):  # #1080
         self.assertIn("10 trang list liên tiếp trả \"0 quán\" (531→540)", red[0])
         self.assertTrue(sent[-1].startswith("⚫ *foody @ Admin* — đã dừng (thấy file STOP)"), sent[-1])
         self.assertIn("Dừng tại: foody page 541, parity even", sent[-1])
+
+class ListCap(unittest.TestCase):
+    """Root cause of "trang N: 0 quán" forever: HomeListPlace returns at most 2000 items per query (count=12 ->
+    page 166 is the last non-empty one) although Total says 37208. Past the cap = end of that query, next slice."""
+
+    def test_page_past_cap_is_end_not_retry(self):
+        st = {"total": 37208}
+        self.assertEqual(ff.plan_empty_page(st, 167, 37208)[0], "end")    # 166*12 = 1992 = last full page under the cap
+        self.assertEqual(ff.plan_empty_page({"total": 37208}, 694, 37208)[0], "end")
+        self.assertEqual(ff.plan_empty_page({"total": 37208}, 166, 37208)[0], "retry")
+
+    def test_build_slices_splits_big_district_by_category(self):
+        totals = {("", 1): 900, ("", 2): 3000, (1, ""): 4104, (2, ""): 1500, (1, 1): 700, (1, 2): 1800}
+        out = ff.build_slices(lambda d, k: totals.get((d, k)), cap=2000, max_id=3)
+        self.assertEqual(out, [{"district": 1, "cate": 1, "total": 700}, {"district": 1, "cate": 2, "total": 1800},
+                               {"district": 2, "cate": "", "total": 1500}])
+
+    def test_main_moves_from_capped_page_to_next_slice(self):
+        root = tempfile.mkdtemp(prefix="foody_cap_")
+        stp = os.path.join(root, "_state.json")
+        json.dump({"page": 694, "done": {}, "failed": {}, "total": 37208}, open(stp, "w"))
+        calls = []
+
+        def fake_list(c, page, count=12, district="", cate=""):
+            calls.append((page, district, cate))
+            if (district, cate) == (5, "") and page == 1:
+                open(os.path.join(root, "STOP"), "w").close()
+                return [{"Id": 2}], 2455
+            return [], 37208
+
+        with mock.patch.object(ff, "ROOT", root), mock.patch.object(ff, "list_page", fake_list), \
+                mock.patch.object(ff, "_build_slices_live", lambda c: [{"district": 5, "cate": "", "total": 2455}]), \
+                mock.patch.object(ff, "process_item", lambda *a, **k: "none"), \
+                mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_notifier", lambda: None):
+            ff.main(["--limit", "0", "--no-push"])
+        self.assertEqual(calls[0], (694, "", ""))
+        self.assertEqual(calls[1], (1, 5, ""))
+        st = json.load(open(stp))
+        self.assertEqual((st["slice"], st["page"]), (1, 2))
+
 
 class Gallery(unittest.TestCase):  # #1081 + #1082
     def test_menu_first_then_dishes_max_five(self):
