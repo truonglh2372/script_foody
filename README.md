@@ -63,6 +63,16 @@ Crawler chết thì không tự báo được; người xem thấy qua "Báo cá
 
 Test offline (chỉ server Slack giả ở 127.0.0.1): `python3 tests/test_slack_notify.py`.
 
+### Tự dọn ổ (sau cảnh báo disk_low 04/11/2026)
+Crawler không có giờ nghỉ cố định, nên job dọn chạy theo lịch: launchd `aqd.cleanup.foody` / Task Scheduler `aqd_cleanup_foody` gọi `common/disk_cleanup.py` mỗi 15 phút, script tự quyết:
+- dọn định kỳ mỗi `AQD_CLEANUP_EVERY_H` giờ (mặc định 6), **hoặc** ngay khi ổ còn < `AQD_CLEANUP_MIN_FREE_GB` (mặc định 8 GB, cao hơn ngưỡng tự tạm dừng của crawler) — tối đa 1 lần/30 phút, giữ cache ít ngày hơn.
+- Không dừng crawler và không đụng file STOP/STOP_ALL: chỉ xoá file crawler không còn dùng tới. Khi ổ dưới ngưỡng, crawler đã tự tạm dừng sẵn và tự chạy lại khi có chỗ.
+- Chỉ xoá thứ tạo lại được: ảnh còn sót trong `foody_data/<fid>/photos/` của quán đã có trong `_cleaned.json` (server đã xác nhận `succeeded`); log `.log/.out/.err` không ghi thêm trong `AQD_CLEANUP_LOG_DAYS` (14) ngày → cắt về rỗng (log xoay `*.log.N` → xoá); log đang ghi > `AQD_CLEANUP_LOG_MAX_MB` (50) → giữ `AQD_CLEANUP_LOG_KEEP_MB` (5) MB cuối; `*.tmp/*.part` > 1 ngày.
+- **Không bao giờ** xoá: json/jsonl dữ liệu, dữ liệu chưa đồng bộ, `crawler.env`, `creds.env`, `*.env`, file secret, `chrome-profile`/profile đăng nhập, venv, `.git`, `bak/`; không theo symlink ra ngoài root.
+- Mỗi lần dọn thật: 1 dòng Slack `🧹 *foody @ <máy>* — tự dọn ổ (định kỳ): giải phóng 3,2 GB (1.234 file) · còn trống 11,5 GB`. Log: `foody_data/cleanup.log`.
+- Cài: `sh mac/install_cleanup.sh` (macOS) · `windows\install_cleanup.ps1` (Windows); gỡ: `--uninstall` / `-Uninstall`. Xem trước, không xoá: `--dry-run` / `-DryRun`. Bộ cài 1 lệnh (`install_crawlers`) tự cài job này.
+- Test offline: `python3 tests/test_disk_cleanup.py` (có dry-run, vùng cấm, symlink, lịch, khoá, dòng Slack, installer launchd với `launchctl` giả).
+
 ## Gọi thẳng server gốc, bỏ qua Cloudflare (an_uong_quanh_day#1058)
 Đường Viettel → Cloudflare SG hay mất gói nên gọi API qua Cloudflare chậm. Thêm **một dòng** vào `creds.env` (hoặc biến môi trường) để gọi thẳng server gốc:
 

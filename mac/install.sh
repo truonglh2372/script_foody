@@ -46,6 +46,7 @@ PLIST
   launchctl bootout "gui/$(id -u)/aqd.foody" 2>/dev/null || true; sleep 2
   launchctl enable "gui/$(id -u)/aqd.foody" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PL"
+  AQD_FOODY_ROOT="$ROOT" sh "$ROOT/mac/install_cleanup.sh" || echo "CẢNH BÁO: chưa cài được job tự dọn ổ (mac/install_cleanup.sh)"
   echo "Đang chạy nền (launchd aqd.foody, parity $PARITY). Log: $ROOT/foody_data/fetch.log | Dừng: launchctl bootout gui/\$(id -u)/aqd.foody"
 else
   nohup .venv/bin/python -u common/foody_fetch.py --limit "$LIMIT" --parity "$PARITY" >> foody_data/fetch.log 2>&1 &

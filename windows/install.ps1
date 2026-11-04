@@ -42,6 +42,8 @@ start "" /min cmd /c ""$V" -u "$Root\common\foody_fetch.py" --limit 0 --parity $
 "@ | Set-Content -Path $Cmd -Encoding ASCII
   Remove-Item (Join-Path $Startup 'aqd_foody.cmd.disabled') -Force -ErrorAction SilentlyContinue
   Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$Cmd`"" -WindowStyle Hidden
+  try { $env:AQD_FOODY_ROOT = $Root; & powershell -NoProfile -ExecutionPolicy Bypass -File "$Root\windows\install_cleanup.ps1" }
+  catch { "CANH BAO: chua cai duoc job tu don o (windows\install_cleanup.ps1): $($_.Exception.Message)" }
   "Dang chay nen (parity $Parity, autostart: $Cmd). Log: $Root\foody_data\fetch.log | Dung: New-Item $Root\foody_data\STOP"
 } else {
   $a = @("-u", "$Root\common\foody_fetch.py", '--limit', $Limit, '--parity', $Parity)
