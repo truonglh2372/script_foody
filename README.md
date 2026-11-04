@@ -22,6 +22,7 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 | `AQD_FOODY_MAX_PHOTOS` | ảnh tối đa / quán, **chỉ** ảnh thực đơn rồi ảnh món (an_uong_quanh_day#1082) | `5` |
 | `AQD_MAX_REVIEWS` | review tối đa / quán, lật trang review đến khi đủ hoặc hết (#1083) | `50` |
 | `AQD_FOODY_LIST_RETRIES` / `AQD_FOODY_LIST_BACKOFF` / `AQD_FOODY_LIST_BACKOFF_MAX` | trang danh sách trống: số lần thử lại, giây chờ đầu (gấp đôi mỗi lần), trần (#1080) | `5` / `30` / `600` |
+| `AQD_FOODY_LIST_TIMEOUT_SKIP` / `AQD_FOODY_TIMEOUT_BACKOFF` | trang danh sách bị ConnectTimeout liên tiếp ngần này lần -> bỏ qua trang, ghi log + báo Slack (không crash); giây chờ giữa các lần timeout (danh sách, giá trị cuối lặp lại) | `6` / `60,120,300,600` |
 | `AQD_FOODY_LIST_SKIP_STREAK` / `AQD_FOODY_LIST_SKIP_PAUSE` | bỏ qua liền ngần này trang thì nghỉ ngần này giây (#1080) | `5` / `1800` |
 | `AQD_FOODY_GALLERY_TRIES` / `AQD_FOODY_GALLERY_BACKOFF` / `AQD_FOODY_GALLERY_BACKOFF_MAX` | album ảnh lỗi: số lần thử lại, giây chờ đầu, trần (#1081) | `5` / `900` / `21600` |
 | `AQD_FOODY_GALLERY_RETRY_PER_PAGE` | số quán chờ thử lại ảnh xử lý trước mỗi trang danh sách (#1081) | `3` |

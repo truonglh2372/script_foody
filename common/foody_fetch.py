@@ -62,6 +62,40 @@ SLICE_MAX_ID = int(os.environ.get("AQD_FOODY_SLICE_MAX_ID", "80"))  # probe dist
 
 # an_uong_quanh_day#1081: a gallery fetch that errors (503/busy, non-JSON, give-up) or comes back empty while the
 # album counts say there are photos must not mark the place done; it is queued in _state.json "gallery_retry".
+# A list page whose request hits this many ConnectTimeouts in a row is skipped (logged + Slack) instead of crashing
+# the crawler; between timeouts wait AQD_FOODY_TIMEOUT_BACKOFF seconds (comma list, the last value repeats).
+def _int_env(name, default, lo=1):
+    try:
+        return max(lo, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+def _backoff_env(name, default):
+    try:
+        vals = [float(x) for x in (os.environ.get(name, "") or default).split(",") if x.strip()]
+        return [v for v in vals if v >= 0] or [float(x) for x in default.split(",")]
+    except ValueError:
+        return [float(x) for x in default.split(",")]
+
+
+LIST_TIMEOUT_SKIP = _int_env("AQD_FOODY_LIST_TIMEOUT_SKIP", 6)
+TIMEOUT_BACKOFF = _backoff_env("AQD_FOODY_TIMEOUT_BACKOFF", "60,120,300,600")  # 1, 2, 5, 10 min, then 10 min
+
+
+def timeout_wait(n):
+    """Seconds to wait after the n-th (1-based) consecutive ConnectTimeout."""
+    return TIMEOUT_BACKOFF[min(n, len(TIMEOUT_BACKOFF)) - 1]
+
+
+class ConnectTimeoutGiveUp(RuntimeError):
+    """Raised by Client.get after LIST_TIMEOUT_SKIP ConnectTimeouts in a row on one URL."""
+
+    def __init__(self, url, count):
+        super().__init__(f"bỏ cuộc sau {count} lần ConnectTimeout liên tiếp: {url}")
+        self.url, self.count = url, count
+
+
 GALLERY_TRIES = int(os.environ.get("AQD_FOODY_GALLERY_TRIES", "5"))
 GALLERY_BACKOFF = float(os.environ.get("AQD_FOODY_GALLERY_BACKOFF", "900"))    # 15 min, 30, 60 ... capped
 GALLERY_BACKOFF_MAX = float(os.environ.get("AQD_FOODY_GALLERY_BACKOFF_MAX", "21600"))
@@ -100,7 +134,8 @@ class Client:
         self.last = 0.0
         self.warm = False
 
-    def get(self, path, referer=None, xhr=False, tries=6, raw=False):
+    def get(self, path, referer=None, xhr=False, tries=None, raw=False):
+        tries = tries or max(6, LIST_TIMEOUT_SKIP)
         url = path if path.startswith("http") else BASE + path
         if not self.warm and not raw:
             self.warm = True
@@ -111,6 +146,7 @@ class Client:
         if xhr:
             h.update({"X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/plain, */*"})
         back = 30
+        timeouts = 0
         for i in range(tries):
             wait = DELAY + random.uniform(0, DELAY / 2) - (time.time() - self.last)
             if wait > 0:
@@ -118,9 +154,18 @@ class Client:
             self.last = time.time()
             try:
                 r = self.s.get(url, headers=h, timeout=40)
+            except requests.ConnectTimeout as e:
+                timeouts += 1
+                if timeouts >= LIST_TIMEOUT_SKIP:
+                    raise ConnectTimeoutGiveUp(url, timeouts) from e
+                w = timeout_wait(timeouts)
+                print(f"  ! ConnectTimeout {url} (lần {timeouts}/{LIST_TIMEOUT_SKIP}) -> chờ {int(w)}s", flush=True)
+                time.sleep(w); continue
             except requests.RequestException as e:
+                timeouts = 0
                 print(f"  ! {e.__class__.__name__} {url} -> chờ {back}s", flush=True)
                 time.sleep(back); back = min(back * 2, 600); continue
+            timeouts = 0
             busy = r.status_code in (429, 403, 503) or (
                 not raw and "text/html" in r.headers.get("content-type", "") and "System Busy" in r.text[:600])
             if busy:
@@ -663,7 +708,12 @@ def _crawl(a, st, stp, pusher, c, page):
                 n += 1
             _save_state(st, stp)
         kw = slice_kw(st)
-        items, total = list_page(c, page, **kw) if kw else list_page(c, page)
+        try:
+            items, total = list_page(c, page, **kw) if kw else list_page(c, page)
+        except ConnectTimeoutGiveUp as e:
+            page = skip_timeout_page(st, page, e)
+            _save_state(st, stp); hb("position", _where(page, a.parity, st))
+            continue
         print(f"trang {page}{' ' + str(kw) if kw else ''}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
             action, nxt, wait = plan_empty_page(st, page, total)
@@ -701,6 +751,19 @@ def _crawl(a, st, stp, pusher, c, page):
         page += 1; st["page"] = page
         _save_state(st, stp); hb("position", _where(page, a.parity, st))
     return n
+
+
+def skip_timeout_page(st, page, exc):
+    """A list page that only ever times out: log it, tell Slack, move on to the next page (never crash)."""
+    nxt = page + 1
+    msg = f"trang {page} ConnectTimeout {exc.count} lần liên tiếp -> bỏ qua, sang trang {nxt}"
+    print(msg, flush=True)
+    skipped = st.setdefault("timeout_skipped", [])
+    skipped.append({"page": page, "slice": st.get("slice"), "at": now()})
+    del skipped[:-50]
+    hb("error", "foody_list_timeout", msg, action="kiểm tra mạng / foody.vn trên máy này; trang đã bỏ qua", severe=True)
+    st["page"] = nxt
+    return nxt
 
 
 def _build_slices_live(c):
