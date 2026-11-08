@@ -141,3 +141,8 @@ python scripts/replay_missing_photos.py enqueue --ids-file scripts/replay_ids/fo
 ```
 `--apply` từ chối nếu `foody_fetch.py` đang chạy hoặc `_state.json` vừa đổi trong 120 giây, và lưu bản sao `_state.json.pre-replay-<giờ>` trước khi ghi. Hoàn tác: dừng crawler, chép bản sao đó đè lại `_state.json`.
 Test offline: `python3 tests/test_replay_missing_photos.py`.
+
+## Toạ độ sai từ Foody (script_foody#18, an_uong_quanh_day#1452)
+Dữ liệu trang Foody của một số quán sai (0,0; (1,2); lat = lng; mất số «1» đầu của vĩ độ như 0.7556 thay vì 10.7556). Crawler **không gửi** điểm nằm ngoài Việt Nam (lat 6–24, lng 101.5–118, cùng hộp với server): ghi vào `foody_data/_bad_coords.json` (kèm lý do, lat/lng, URL), bỏ qua khi quét backlog, và khi fetch lại mà điểm đã đúng thì tự gửi. Server trả 422 `import_coordinates_out_of_range` cũng được ghi vào file đó, không thử lại, không tính là lỗi.
+Sửa quán đã lên server: `python scripts/repair_coordinates.py --ids-file scripts/replay_ids/foody_bad_coords_1452.tsv` (dry-run), thêm `--apply` để PATCH các dòng Foody đã trả điểm đúng. Dòng `[manual]` = Foody vẫn sai → đặt ghim tay trong admin.
+Test: `python3 tests/test_coordinates.py`, `python3 tests/test_repair_coordinates.py`.
