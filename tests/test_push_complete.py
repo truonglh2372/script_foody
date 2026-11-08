@@ -23,6 +23,7 @@ import aqd_api  # noqa: E402
 import foody_upload as fu  # noqa: E402
 import foody_push as fp  # noqa: E402
 import foody_fetch as ff  # noqa: E402
+DATA = fp.ROOT  # modules are cached across a discover run: use the root the first importer fixed
 
 
 class FakeResp:
