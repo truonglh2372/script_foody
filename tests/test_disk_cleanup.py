@@ -28,6 +28,9 @@ class FakeNotifier:
     def cleanup(self, *a):
         self.calls.append(a)
 
+    def disk_low_nothing(self, *a):
+        self.calls.append(("low",) + a)
+
 
 def gmaps_tree(r):
     d = os.path.join(r, "aqd_data")
@@ -241,6 +244,27 @@ class SlackResultLoggedTest(unittest.TestCase):
             lines = []
             dc.run("gmaps", r, force=True, notifier=n, env={}, say=lines.append)
         self.assertIn("slack: chưa cấu hình webhook", lines)
+
+
+class QuietTest(unittest.TestCase):
+    def test_nothing_freed_no_slack_and_low_alert_once_per_6h(self):
+        dc.top_space_users = lambda: "docker 40GB"
+        with tempfile.TemporaryDirectory() as r:
+            n = FakeNotifier(); e = {"AQD_CLEANUP_MIN_FREE_GB": "1e9"}
+            dc.run("gmaps", r, force=True, now=NOW, notifier=n, env={"AQD_CLEANUP_MIN_FREE_GB": "0"}, say=lambda s: None)
+            self.assertEqual(n.calls, [])
+            dc.run("gmaps", r, force=True, now=NOW, notifier=n, env=e, say=lambda s: None)
+            self.assertEqual(n.calls[0][0], "low"); self.assertIn("docker 40GB", n.calls[0])
+            dc.run("gmaps", r, force=True, now=NOW + 3600, notifier=n, env=e, say=lambda s: None)
+            self.assertEqual(len(n.calls), 1)
+            dc.run("gmaps", r, force=True, now=NOW + 7 * 3600, notifier=n, env=e, say=lambda s: None)
+            self.assertEqual(len(n.calls), 2)
+
+    def test_docker_opt_in_never_volumes(self):
+        seen = []
+        self.assertFalse(dc.docker_prune({}, say=lambda s: None, runner=seen.append)); self.assertEqual(seen, [])
+        self.assertTrue(dc.docker_prune({"AQD_CLEANUP_DOCKER": "1"}, say=lambda s: None, runner=seen.append))
+        self.assertTrue(seen and all("volume" not in a for a in seen))
 
 
 if __name__ == "__main__":

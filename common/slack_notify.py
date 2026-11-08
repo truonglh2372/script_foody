@@ -444,6 +444,14 @@ class Notifier:
                 + f" · {ddmm_hhmm(self.now())} (UTC+7)")
         return self._send("cleanup", text)
 
+    def disk_low_nothing(self, free_gb=None, top=""):
+        """Ổ thấp nhưng phạm vi crawler không còn gì để dọn (job tự giới hạn 1 lần / 6 giờ)."""
+        free = self.disk_free_gb() if free_gb is None else free_gb
+        text = (f"⚠️ {self._title()} — ổ thấp" + (f" (còn {gb(free)})" if free is not None else "")
+                + ", thư mục crawler không còn gì để dọn. Chỗ đang chiếm: " + _clean(top, 600)
+                + f" · {ddmm_hhmm(self.now())} (UTC+7)")
+        return self._send("cleanup", text)
+
     # ---- lifecycle (long-running process) ------------------------------------------------------------------------
     def start(self, command="", extra=None):
         def fn(st):
