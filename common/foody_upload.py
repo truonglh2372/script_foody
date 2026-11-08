@@ -21,7 +21,7 @@ Server CHƯA nhận (không gửi, ghi trong PR #7 là việc phía server): pri
   python common/foody_upload.py --apply             # gửi thật
   python common/foody_upload.py --apply --ids 30086 44253
 """
-import argparse, json, os, re, sys
+import argparse, json, math, os, re, sys
 from datetime import datetime, timezone
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -170,13 +170,31 @@ def payload(p):
     return {k: v for k, v in body.items() if v is not None}
 
 
+# Same box as the server's AdminBoundaries.inside_vietnam? (core), Hoang Sa / Truong Sa included (an_uong_quanh_day#1452).
+VN_LAT = (6.0, 24.0)
+VN_LNG = (101.5, 118.0)
+
+
+def coords_problem(lat, lng):
+    """None when (lat, lng) can be a point in Vietnam, else why not: "coords" (missing / not a number),
+    "coords_lat_equals_lng" (one value copied into the other), "coords_out_of_vietnam" (0,0, (1,2), a lost leading digit).
+    Foody's own page data is wrong for some places, so this is the only gate before the import API."""
+    try:
+        a, b = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return "coords"
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return "coords"
+    if not (VN_LAT[0] <= a <= VN_LAT[1] and VN_LNG[0] <= b <= VN_LNG[1]):
+        return "coords_lat_equals_lng" if a == b and a != 0 else "coords_out_of_vietnam"
+    return None
+
+
 def problems(b):
     out = [k for k in ("name", "address", "source_id") if not str(b.get(k) or "").strip()]
-    try:
-        if not (-90 <= float(b["lat"]) <= 90 and -180 <= float(b["lng"]) <= 180):
-            out.append("coords_range")
-    except (KeyError, TypeError, ValueError):
-        out.append("coords")
+    c = coords_problem(b.get("lat"), b.get("lng"))
+    if c:
+        out.append(c)
     return out
 
 
