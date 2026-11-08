@@ -3,8 +3,8 @@
   1  string-form API errors ({"status":404,"error":"Not Found"}) raise APIError with the real status, not AttributeError;
      cleanup/review_rows tolerate non-dict items; Pusher.handle prints the full traceback.
   2  phones: list_phone / phone / phones merged and normalised to Vietnamese numbers.
-  3  fields the import API does not accept (price, score, description) are NOT invented in the payload.
-  4  review payload: published_at (ISO 8601), no title field, at most AQD_MAX_REVIEWS (50).
+  3  the payload only carries keys the import API permits (price/score/description: tests/test_source_details.py).
+  4  review payload: published_at (ISO 8601), title when present, at most AQD_MAX_REVIEWS (50).
   5  menu: window.intMenu read whatever follows the object.
   6  opening hours: Foody's after-midnight tail (00:05-01:00) is folded into the previous evening's shift.
   7  backfill mode: re-sends import + missing reviews for places already created, never creates a new place.
@@ -112,11 +112,11 @@ class FieldsTest(unittest.TestCase):
     def test_only_fields_the_import_api_permits(self):
         # Api::V1::Admin::ImportRestaurantsController#payload permits exactly these keys.
         permitted = {"source", "source_id", "source_url", "name", "address", "district", "city", "lat", "lng",
-                     "website", "phones", "cuisines", "categories", "opening_periods", "menu"}
+                     "website", "phones", "cuisines", "categories", "opening_periods", "menu",
+                     "description", "price_min", "price_max", "rating", "rating_scale", "review_count", "sub_scores"}
         body = fu.payload(place(source_url="https://www.foody.vn/x", district="Q1", city="HCM"))
         self.assertLessEqual(set(body), permitted)
-        for k in ("price_min", "price_max", "rating", "review_count", "rating_breakdown", "description"):
-            self.assertNotIn(k, body)
+        self.assertNotIn("rating_breakdown", body)  # sent as sub_scores (tests/test_source_details.py)
 
 
 class ReviewPayloadTest(unittest.TestCase):
@@ -131,10 +131,10 @@ class ReviewPayloadTest(unittest.TestCase):
         self.assertEqual([r["source_id"] for r in rows], ["11", "12", "13"])
         self.assertEqual(rows[0], {"source": "foody", "source_id": "11", "source_url": "https://www.foody.vn/r/11",
                                    "author_name": "An", "rating_original": 8.5, "text": "Bún ngon",
-                                   "published_at": "2026-10-17T09:30:00+00:00"})
+                                   "published_at": "2026-10-17T09:30:00+00:00", "title": "Ngon"})
         self.assertEqual(rows[1]["published_at"], "2025-10-09T08:53:20+00:00")
         self.assertNotIn("published_at", rows[2])  # unreadable date is dropped, never sent malformed
-        self.assertNotIn("title", rows[0])
+        self.assertNotIn("title", rows[1])  # no title -> key left out
 
     def test_local_date_gets_vn_offset(self):
         self.assertEqual(fu.iso_time("17/10/2026 21:05"), "2026-10-17T21:05:00+07:00")
