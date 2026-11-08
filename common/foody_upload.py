@@ -14,14 +14,14 @@ Endpoint thật (an_uong_quanh_day: app/controllers/api/v1/admin/import_restaura
                                                  rating_original(0-10), text, published_at(ISO 8601)}]} (#736)
                                                  -> foody_push.Pusher.push_reviews (tối đa AQD_MAX_REVIEWS=50/quán).
 Script này (foody_upload.py) chỉ ghi review vào foody_data/_reviews_pending.jsonl; gửi review do foody_push lo.
-Server CHƯA nhận (không gửi, ghi trong PR #7 là việc phía server): price_min/max, điểm Foody + số đánh giá,
-điểm thành phần, mô tả quán, tiêu đề review.
+Từ web#1390 server nhận thêm: price_min/max, rating (+rating_scale=10 của Foody), review_count, sub_scores (điểm thành
+phần), description, và title của review; chế độ re-crawl mode "update" + fields[] (update_payload; foody_push --update).
 
   python common/foody_upload.py                     # dry-run: kiểm tra payload, ghi foody_data/_upload_preview.jsonl
   python common/foody_upload.py --apply             # gửi thật
   python common/foody_upload.py --apply --ids 30086 44253
 """
-import argparse, json, math, os, re, sys
+import argparse, html, json, math, os, re, sys
 from datetime import datetime, timezone
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -149,6 +149,66 @@ def phones_of(p):
     return out
 
 
+# web#1390: what the server stores per source (Imports::SourceDetails) and may overwrite in mode "update".
+RATING_SCALE = 10  # Foody scores run 0..10
+DESCRIPTION_MAX = 1000
+TITLE_MAX = 200
+MAX_SUB_SCORES = 10
+SUB_SCORE_KEY_MAX = 50
+UPDATABLE_FIELDS = ("phone", "website", "cuisine", "category", "address_district", "address_city", "description",
+                    "opening_periods")
+
+
+def _number(v):
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
+def plain_text(v, limit):
+    """HTML -> plain text, whitespace collapsed, capped at limit chars. None when nothing is left."""
+    t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(v or "")))).strip()
+    return t[:limit].strip() or None
+
+
+def source_details(p):
+    """price/score/description keys for the import payload; any value the server would refuse (422) is left out."""
+    out = {}
+    lo, hi = _price(p.get("price_min")), _price(p.get("price_max"))
+    if lo and hi and lo > hi:
+        lo = hi = None
+    out["price_min"], out["price_max"] = lo, hi
+    rating = _number(p.get("rating"))
+    if rating is not None and not 0 <= rating <= RATING_SCALE:
+        rating = None
+    subs = {}
+    raw = p.get("rating_breakdown")
+    for k, v in (raw.items() if isinstance(raw, dict) else []):
+        n, key = _number(v), str(k).strip()
+        if n is not None and 0 <= n <= RATING_SCALE and key and len(key) <= SUB_SCORE_KEY_MAX and len(subs) < MAX_SUB_SCORES:
+            subs[key] = n
+    if rating is not None or subs:
+        out["rating"], out["rating_scale"], out["sub_scores"] = rating, RATING_SCALE, subs or None
+    count = _number(p.get("review_count"))
+    out["review_count"] = int(count) if count is not None and count >= 0 else None
+    out["description"] = plain_text(p.get("description"), DESCRIPTION_MAX)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def update_payload(p, fields):
+    """Body for a re-crawl of an already imported place: payload + mode "update" + the fields the server may overwrite.
+    The server skips (with a reason) every field a person edited after the import."""
+    fields = list(dict.fromkeys(str(f).strip() for f in fields or [] if str(f).strip()))
+    if not fields:
+        raise ValueError("fields is empty")
+    bad = [f for f in fields if f not in UPDATABLE_FIELDS]
+    if bad:
+        raise ValueError(f"fields the server cannot update: {bad} (allowed: {list(UPDATABLE_FIELDS)})")
+    return {**payload(p), "mode": "update", "fields": fields}
+
+
 def payload(p):
     menu = []
     for m in p.get("menu") or []:
@@ -166,7 +226,7 @@ def payload(p):
             "district": p.get("district"), "city": p.get("city"), "lat": p.get("lat"), "lng": p.get("lng"),
             "website": p.get("website"), "phones": phones_of(p),
             "cuisines": p.get("cuisines") or [], "categories": p.get("categories") or [],
-            "opening_periods": per, "menu": menu}
+            "opening_periods": per, "menu": menu, **source_details(p)}
     return {k: v for k, v in body.items() if v is not None}
 
 

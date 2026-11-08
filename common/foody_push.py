@@ -198,10 +198,11 @@ class Pusher:
                 continue
             if not 0 <= ro <= 10:
                 continue
-            # #7 mục 4: published_at (server: source_created_at, ISO 8601). Tiêu đề: server CHƯA có field -> không gửi.
+            # #7 mục 4: published_at (server: source_created_at, ISO 8601). web#1390: title -> comments.source_title.
             row = {"source": "foody", "source_id": r["source_id"], "source_url": r.get("source_url") or None,
                    "author_name": r.get("author_name"), "rating_original": ro, "text": r.get("text") or "",
-                   "published_at": fu.iso_time(r.get("created_at"))}
+                   "published_at": fu.iso_time(r.get("created_at")),
+                   "title": fu.plain_text(r.get("title"), fu.TITLE_MAX)}
             rows.append({k: v for k, v in row.items() if v is not None})
         return rows[:fu.MAX_REVIEWS]
 
@@ -324,19 +325,59 @@ def backfill(pusher, ids=None, apply=False, out=print):
     return st
 
 
+def update_existing(pusher, ids=None, fields=None, apply=False, out=print):
+    """web#1390 re-crawl: for places already created, POST the import with mode "update" + fields. The server overwrites
+    each listed field unless a person edited it after the import (skipped + reason) and writes an audit row per change.
+    Never creates a place; a different restaurant_id back stops that place. Default dry-run."""
+    st = {"places": 0, "applied": 0, "skipped": 0, "mismatch": 0, "fail": 0}
+    for fid in backfill_ids(pusher.done, ids):
+        rid = pusher.done[fid]["restaurant_id"]; p = load_place(fid)
+        if p is None:
+            continue
+        st["places"] += 1
+        try:
+            body = fu.update_payload(p, fields)
+            if fu.problems(body):
+                st["fail"] += 1; out(f"[update ✗] #{fid}: payload thiếu {fu.problems(body)}"); continue
+            if not apply:
+                out(f"[dry] #{fid} -> quán {rid} | update {body['fields']}"); continue
+            r = pusher.api.call("POST", EP, json_body=body)
+            got = r.get("restaurant_id") if isinstance(r, dict) else None
+            if str(got) != str(rid):
+                st["mismatch"] += 1
+                out(f"[update ✗] #{fid}: server trả quán {got}, bản ghi là {rid} -> bỏ qua, cần admin xem"); continue
+            ch = r.get("changes") or {}
+            st["applied"] += len(ch.get("applied") or []); st["skipped"] += len(ch.get("skipped") or [])
+            skipped = ", ".join(f"{x.get('field')}:{x.get('reason')}" for x in ch.get("skipped") or [])
+            out(f"[update ✓] #{fid} -> quán {rid} | đã ghi {ch.get('applied') or []} | bỏ qua {skipped or '-'}")
+        except Exception as e:
+            st["fail"] += 1
+            out(f"[update ✗] #{fid}: {type(e).__name__} {str(e)[:300]}")
+    return st
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Đẩy bù review/field cho quán Foody đã tạo (không tạo lại quán)")
-    ap.add_argument("--backfill", action="store_true", required=True)
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--backfill", action="store_true")
+    mode.add_argument("--update", action="store_true",
+                      help="web#1390: gửi lại với mode=update cho các field trong --fields (server ghi audit, bỏ qua field đã sửa tay)")
+    ap.add_argument("--fields", nargs="*", default=[], help="với --update: " + ", ".join(fu.UPDATABLE_FIELDS))
     ap.add_argument("--ids", nargs="*", help="Foody id; mặc định mọi quán có restaurant_id trong _uploaded.json")
     ap.add_argument("--apply", action="store_true", help="gửi thật (mặc định dry-run)")
     a = ap.parse_args(argv)
+    if a.update:
+        try:
+            fu.update_payload({"source_id": "0"}, a.fields)  # validate --fields before touching the server
+        except ValueError as e:
+            ap.error(str(e))
     if a.apply:
         pusher = Pusher()
     else:
         pusher = Pusher.__new__(Pusher)
         pusher.done = _read(UP, {}); pusher.cleaned = _read(CL, {}); pusher.rpushed = _read(RP, {})
         pusher.stats = {"reviews": 0}
-    st = backfill(pusher, a.ids, apply=a.apply)
+    st = update_existing(pusher, a.ids, a.fields, apply=a.apply) if a.update else backfill(pusher, a.ids, apply=a.apply)
     print("TỔNG", json.dumps(st, ensure_ascii=False))
     if not a.apply:
         print("DRY-RUN: không gửi gì lên server. Thêm --apply để gửi thật.")
