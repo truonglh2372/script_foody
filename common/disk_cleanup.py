@@ -16,7 +16,10 @@ CHỈ xoá thứ tạo lại được:
           (50) -> cắt còn AQD_CLEANUP_LOG_KEEP_MB (5) cuối; *.tmp/*.part cũ hơn 1 ngày.
 KHÔNG BAO GIỜ xoá: json/jsonl dữ liệu, quán chưa SAFE_DONE / chưa _cleaned, crawler.env, creds.env, *.env, file secret,
 chrome-profile, profile đăng nhập, venv, .git, bak/.
-Mỗi lần dọn thật: một dòng Slack qua slack_notify (#1388). --dry-run: chỉ liệt kê, không xoá, không gửi Slack.
+Mỗi lần dọn thật CÓ giải phóng: một dòng Slack qua slack_notify (#1388). Dọn 0 file -> không gửi; nếu ổ thấp thì
+tối đa 1 cảnh báo / AQD_CLEANUP_ALERT_H (6) giờ, kèm top thư mục chiếm ổ ngoài phạm vi crawler (docker, home).
+AQD_CLEANUP_DOCKER=1 (mặc định tắt): khi ổ thấp chạy thêm `docker builder prune --filter until=72h` và
+`docker image prune -f` (chỉ image dangling). KHÔNG BAO GIỜ prune volume. --dry-run: chỉ liệt kê, không xoá, không gửi Slack.
 """
 import argparse, json, os, sys, time
 
@@ -34,6 +37,49 @@ NEVER_EXT = (".env", ".json", ".jsonl", ".py", ".sh", ".ps1", ".cmd", ".plist", 
 SETTLE = 3600          # SAFE_DONE phải cũ hơn 1 giờ
 LOW_GAP = 1800         # ổ thấp: tối đa 1 lần dọn / 30 phút
 TMP_AGE = 86400
+DOCKER_CMDS = (["docker", "builder", "prune", "-f", "--filter", "until=72h"], ["docker", "image", "prune", "-f"])
+
+
+def _cmd(args, timeout):
+    import subprocess
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def docker_prune(env, say=print, runner=None):
+    """Opt-in (AQD_CLEANUP_DOCKER=1). Chỉ build cache cũ + image dangling; không bao giờ đụng volume."""
+    if (env.get("AQD_CLEANUP_DOCKER") or "0") != "1":
+        return False
+    runner = runner or (lambda a: _cmd(a, 600))
+    for a in DOCKER_CMDS:
+        assert "volume" not in a
+        runner(a)
+    say("docker: đã prune build cache cũ + image dangling")
+    return True
+
+
+def top_space_users(runner=None, limit=6):
+    """Văn bản ngắn: docker system df + thư mục lớn nhất trong home (bỏ qua nếu không có lệnh)."""
+    runner = runner or (lambda a: _cmd(a, 180))
+    out = []
+    df = runner(["docker", "system", "df", "--format", "{{.Type}} {{.Size}} (thu hồi {{.Reclaimable}})"]).strip()
+    if df:
+        out.append("docker: " + "; ".join(df.splitlines()))
+    home = os.path.expanduser("~")
+    du = runner(["du", "-xhd1", home]) if os.name != "nt" else ""
+    def key(line):
+        v = line.split("\t")[0].strip(); m = {"K": 1, "M": 2 ** 10, "G": 2 ** 20, "T": 2 ** 30}
+        try:
+            return float(v[:-1]) * m.get(v[-1], 0)
+        except (ValueError, IndexError):
+            return 0
+    rows = sorted((l for l in du.splitlines() if "\t" in l and l.split("\t")[1] != home), key=key, reverse=True)[:limit]
+    if rows:
+        out.append("home: " + ", ".join(f"{os.path.basename(l.split(chr(9))[1])} {l.split(chr(9))[0].strip()}" for l in rows))
+    return " · ".join(out) or "không đo được"
 
 
 def env_num(env, name, default):
@@ -265,6 +311,11 @@ def run(crawler, root, dry_run=False, force=False, now=None, notifier=None, env=
             say("đang có lượt dọn khác -> bỏ qua"); return {"ran": False}
         plan = PROFILES[crawler](root, now, o)
         freed, files = execute(plan, root, o, dry_run, say)
+        if low and not dry_run:
+            env_ = os.environ if env is None else env
+            b4 = free_gb(sd)
+            if docker_prune(env_, say) and b4 is not None and free_gb(sd) is not None:
+                freed += max(0, int((free_gb(sd) - b4) * 1024 ** 3))
     after = free_gb(sd)
     say(f"{'[dry-run] ' if dry_run else ''}{crawler}: {trigger}; {files} file, {freed / 1024 ** 3:.2f} GB"
         + (f"; còn trống {after:.1f} GB" if after is not None else ""))
@@ -273,11 +324,22 @@ def run(crawler, root, dry_run=False, force=False, now=None, notifier=None, env=
         tmp = stp + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f)
         os.replace(tmp, stp)
+        alert_gap = env_num(os.environ if env is None else env, "AQD_CLEANUP_ALERT_H", 6) * 3600
+        send_alert = not (freed or files) and low and now - float(st.get("last_alert") or 0) >= alert_gap
+        if not (freed or files) and not send_alert:
+            say("slack: bỏ qua (không giải phóng gì)")
+            return {"ran": True, "freed": freed, "files": files, "trigger": trigger, "plan": plan}
         try:
             if notifier is None:
                 import slack_notify
                 notifier = slack_notify.Notifier(crawler, sd)
-            ok = notifier.cleanup(freed, files, after, trigger)
+            if send_alert:
+                st["last_alert"] = now
+                with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f)
+                os.replace(tmp, stp)
+                ok = notifier.disk_low_nothing(after, top_space_users())
+            else:
+                ok = notifier.cleanup(freed, files, after, trigger)
             res = getattr(notifier, "last_result", None) or ("ok" if ok else "lỗi")
             say(f"slack: {res}")  # ok / http <code> / lỗi; never the webhook URL
         except Exception as e:  # noqa: BLE001 - Slack never breaks the cleanup
