@@ -4,6 +4,7 @@ Network only to a fake Slack server on 127.0.0.1; never a real webhook.
 Run: python3 <tests dir>/test_slack_notify.py
 """
 import http.server, json, os, sys, tempfile, threading, time, unittest
+from pathlib import Path
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,14 +70,14 @@ class Config(Base):
     def test_env_then_file_then_nothing(self):
         self.assertEqual(sn.webhook_url({"SLACK_CRAWLER_WEBHOOK_URL": " https://h/x "}), "https://h/x")
         f = os.path.join(self.dir, "hook")
-        open(f, "w").write("https://from-file/x\n")
+        Path(f).write_text(encoding="utf-8", data="https://from-file/x\n")
         self.assertEqual(sn.webhook_url({"SLACK_CRAWLER_WEBHOOK_FILE": f}), "https://from-file/x")
         self.assertEqual(sn.webhook_url({"SLACK_CRAWLER_WEBHOOK_FILE": f + "nope"}), "")
         self.assertEqual(sn.webhook_url({"SLACK_CRAWLER_WEBHOOK_URL": "not a url"}), "")
 
     def test_key_value_secret_file_env_wins(self):
         f = os.path.join(self.dir, "slack_webhook")
-        open(f, "w").write("# máy Admin\nSLACK_CRAWLER_WEBHOOK_URL=https://file/x\nAQD_HOST_LABEL=Admin\n"
+        Path(f).write_text(encoding="utf-8", data="# máy Admin\nSLACK_CRAWLER_WEBHOOK_URL=https://file/x\nAQD_HOST_LABEL=Admin\n"
                            "SLACK_ALERT_MENTION=U0FILE\n")
         conf = sn.settings({"SLACK_CRAWLER_WEBHOOK_FILE": f, "AQD_HOST_LABEL": "Mac mini"})
         self.assertEqual((conf["SLACK_CRAWLER_WEBHOOK_URL"], conf["AQD_HOST_LABEL"], conf["SLACK_ALERT_MENTION"]),
@@ -88,7 +89,7 @@ class Config(Base):
         f = os.path.join(self.dir, "crawler.env")
         env = {"AQD_CRAWLER_ENV": f}
         self.assertNotEqual(sn.default_secret_file(env), f)
-        open(f, "w").write("# sửa tay\nSLACK_CRAWLER_WEBHOOK_URL=https://env-file/x\nAQD_HOST_LABEL=Admin\nSLACK_ALERT_MENTION=\n")
+        Path(f).write_text(encoding="utf-8", data="# sửa tay\nSLACK_CRAWLER_WEBHOOK_URL=https://env-file/x\nAQD_HOST_LABEL=Admin\nSLACK_ALERT_MENTION=\n")
         self.assertEqual(sn.default_secret_file(env), f)
         conf = sn.settings(env)
         self.assertEqual((conf["SLACK_CRAWLER_WEBHOOK_URL"], conf["AQD_HOST_LABEL"]), ("https://env-file/x", "Admin"))
