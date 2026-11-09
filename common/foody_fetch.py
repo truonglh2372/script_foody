@@ -28,6 +28,9 @@ import requests
 BASE = "https://www.foody.vn"
 CITY = os.environ.get("AQD_FOODY_CITY", "ho-chi-minh")
 CITY_ID = int(os.environ.get("AQD_FOODY_CITY_ID", "217"))
+# Multi-city: AQD_FOODY_CITIES=all (default) or comma slugs/ids. AQD_FOODY_CITY forces a single city when set
+# without AQD_FOODY_CITIES. Discovery seed: data/foody_cities.json; verified cache: foody_data/_cities.json.
+CITIES_ENV = os.environ.get("AQD_FOODY_CITIES")  # None = all (unless AQD_FOODY_CITY alone)
 DELAY = float(os.environ.get("AQD_FOODY_DELAY", "2.0"))
 ROOT = os.environ.get("AQD_FOODY_DATA", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "foody_data"))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -128,18 +131,38 @@ def now():
 
 
 class Client:
-    def __init__(self):
+    def __init__(self, city=None, city_id=None, lat=None, lng=None):
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": UA, "Accept-Language": "vi-VN,vi;q=0.9"})
         self.last = 0.0
         self.warm = False
+        self.city = city or CITY
+        self.city_id = int(city_id if city_id is not None else CITY_ID)
+        self.lat = float(lat if lat is not None else 10.823099)
+        self.lng = float(lng if lng is not None else 106.629664)
+
+    def set_city(self, city):
+        """Switch Foody province: cookie floc + /{slug}/o-dau warm. city is a dict from foody_cities."""
+        self.city = city["slug"]
+        self.city_id = int(city["id"])
+        if city.get("lat") and city.get("lng"):
+            self.lat, self.lng = float(city["lat"]), float(city["lng"])
+        self.warm = False
+        self.s.cookies.set("flg", "vn", domain="www.foody.vn")
+        self.s.cookies.set("floc", str(self.city_id), domain="www.foody.vn")
+        # Force a warm hit so Foody binds the session to this province.
+        global CITY, CITY_ID
+        CITY, CITY_ID = self.city, self.city_id
+        self.get(f"/{self.city}/o-dau")
+        self.warm = True
+        print(f"[city] đang cào {self.city} (id={self.city_id}) lat={self.lat} lng={self.lng}", flush=True)
 
     def get(self, path, referer=None, xhr=False, tries=None, raw=False):
         tries = tries or max(6, LIST_TIMEOUT_SKIP)
         url = path if path.startswith("http") else BASE + path
         if not self.warm and not raw:
             self.warm = True
-            self.get(f"/{CITY}/o-dau")
+            self.get(f"/{self.city}/o-dau")
         h = {}
         if referer:
             h["Referer"] = referer if referer.startswith("http") else BASE + referer
@@ -191,9 +214,11 @@ class Client:
 
 # ---------- danh sách ----------
 def list_page(c, page, count=12, district="", cate=""):
-    q = (f"/__get/Place/HomeListPlace?t={int(time.time()*1000)}&page={page}&lat=10.823099&lon=106.629664"
+    lat, lon = getattr(c, "lat", 10.823099), getattr(c, "lng", 106.629664)
+    city = getattr(c, "city", CITY)
+    q = (f"/__get/Place/HomeListPlace?t={int(time.time()*1000)}&page={page}&lat={lat}&lon={lon}"
          f"&count={count}&districtId={district}&cateId={cate}&cuisineId=&isReputation=&type=1")
-    d = c.json(q, referer=f"/{CITY}/o-dau") or {}
+    d = c.json(q, referer=f"/{city}/o-dau") or {}
     return d.get("Items") or [], d.get("Total")
 
 
@@ -647,6 +672,8 @@ def main(argv=None):
     ap.add_argument("--parity", choices=["odd", "even", "all"],
                     default=os.environ.get("AQD_FOODY_PARITY", "all") or "all",
                     help="chia việc 2 máy theo Foody id: odd (Mac) / even (Admin)")
+    ap.add_argument("--cities", default=None,
+                    help="all (mặc định) hoặc danh sách slug/id cách nhau bởi dấu phẩy; ghi đè AQD_FOODY_CITIES")
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
     global HB
@@ -657,15 +684,45 @@ def main(argv=None):
     except Exception as e:
         print(f"[warn] _state.json hỏng ({e}) -> dùng bản .bak nếu có", flush=True)
         st = json.load(open(stp + ".bak", encoding="utf-8")) if os.path.exists(stp + ".bak") else {"page": 1, "done": {}, "failed": {}}
-    st.setdefault("done", {}); st.setdefault("failed", {})
+    import foody_cities as cities_mod
+    st = cities_mod.migrate_state(st, default_slug=CITY)
+    # City selection: --cities / AQD_FOODY_CITIES / default all. AQD_FOODY_SINGLE_CITY=1 keeps legacy one-city mode.
+    if getattr(a, "cities", None) is not None:
+        wanted = a.cities
+    elif CITIES_ENV is not None:
+        wanted = CITIES_ENV
+    elif os.environ.get("AQD_FOODY_SINGLE_CITY", "").strip().lower() in ("1", "true", "yes"):
+        wanted = os.environ.get("AQD_FOODY_CITY", CITY)
+    else:
+        wanted = "all"
+    verify = os.environ.get("AQD_FOODY_VERIFY_CITIES", "0").strip().lower() not in ("0", "false", "no", "")
+    # Default verify off so install/restart is fast; first run can set AQD_FOODY_VERIFY_CITIES=1.
+    city_rows = cities_mod.discover_cities(root=ROOT, verify=verify)
+    city_rows = cities_mod.filter_cities(city_rows, wanted)
+    if not city_rows:
+        raise SystemExit("không có city nào để cào (data/foody_cities.json rỗng hoặc filter loại hết)")
+    order = [c["slug"] for c in city_rows]
+    by_slug = {c["slug"]: c for c in city_rows}
+    prev = [s for s in (st.get("city_order") or []) if s in by_slug]
+    st["city_order"] = prev + [s for s in order if s not in prev]
+    for s in st["city_order"]:
+        cities_mod.ensure_city_bucket(st, s)
+    if st.get("city") not in by_slug:
+        st["city_index"] = 0
+        st["city"] = st["city_order"][0]
+    else:
+        st["city_index"] = st["city_order"].index(st["city"])
+    bucket = cities_mod.ensure_city_bucket(st, st["city"])
     pusher = None
     if not a.no_push:
         from foody_push import Pusher, free_gb
         pusher = Pusher().start()
-    page = a.start_page or st.get("page", 1)
+    page = a.start_page or bucket.get("page", 1)
     c, n = Client(), 0
-    print(f"parity={a.parity} page={page} known_total={st.get('total')}", flush=True)
-    hb("position", _where(page, a.parity, st))
+    c.set_city(by_slug[st["city"]])
+    print(f"parity={a.parity} city={st['city']} ({st['city_index']+1}/{len(st['city_order'])}) "
+          f"page={page} known_total={bucket.get('total')} cities={len(st['city_order'])}", flush=True)
+    hb("position", _where(page, a.parity, st, bucket))
     hb("start", "foody_fetch.py " + " ".join(sys.argv[1:] if argv is None else argv))
     if pusher:  # reviews / uploads come from the pusher thread's running totals
         hb("track_totals", lambda: {"reviews": pusher.stats["reviews"], "upload_ok": pusher.stats["pushed"],
@@ -680,19 +737,39 @@ def main(argv=None):
     print(f"xong: {n} quán")
 
 
-def _where(page, parity, st):
-    total = st.get("total")
-    kw = slice_kw(st)
-    sl = (f" [lát {st.get('slice')}/{len(st.get('slices') or [])}: quận {kw['district']}"
+def _where(page, parity, st, bucket=None):
+    bucket = bucket if bucket is not None else _active_bucket(st)
+    total = bucket.get("total")
+    kw = slice_kw(bucket)
+    sl = (f" [lát {bucket.get('slice')}/{len(bucket.get('slices') or [])}: quận {kw['district']}"
           + (f", loại {kw['cate']}" if kw["cate"] != "" else "") + "]") if kw else ""
-    return f"foody page {page}{sl}, parity {parity}" + (f" (tổng list {int(total):,})".replace(",", ".") if total else "")
+    city = st.get("city") or CITY
+    return (f"foody page {page}{sl}, city {city}, parity {parity}"
+            + (f" (tổng list {int(total):,})".replace(",", ".") if total else ""))
+
+
+def _active_bucket(st):
+    """Per-city bucket; falls back to st itself for unit tests that still use a flat state."""
+    if int(st.get("schema") or 0) >= 2 and isinstance(st.get("cities"), dict):
+        import foody_cities as cities_mod
+        slug = st.get("city") or (st.get("city_order") or ["ho-chi-minh"])[0]
+        return cities_mod.ensure_city_bucket(st, slug)
+    return st
 
 
 def _crawl(a, st, stp, pusher, c, page):
     if pusher:
         from foody_push import free_gb  # imported in main() too, but that name is local there (NameError since #9)
+    import foody_cities as cities_mod
+    by_slug = {x["slug"]: x for x in (cities_mod.load_cached(ROOT) or cities_mod.seed_cities())}
+    # Prefer the live order already on st (filtered in main)
+    for slug in st.get("city_order") or []:
+        if slug not in by_slug:
+            # keep a stub so set_city still works if cache was filtered
+            by_slug[slug] = {"slug": slug, "id": CITY_ID, "name": slug, "lat": c.lat, "lng": c.lng}
     n = 0
     while a.limit == 0 or n < a.limit:
+        b = _active_bucket(st)
         if os.path.exists(os.path.join(ROOT, "STOP")):
             print("thấy file STOP -> dừng cào" + (", đẩy nốt backlog rồi thoát" if pusher else ""), flush=True)
             if pusher: pusher.drain_and_stop(); pusher.t.join()
@@ -701,56 +778,72 @@ def _crawl(a, st, stp, pusher, c, page):
             print(f"ổ còn {free_gb():.1f} GB < {a.min_free_gb} GB -> tạm ngừng cào 5 phút, uploader đang xoá ảnh đã lên", flush=True)
             hb("error", "disk_low", f"Ổ đĩa còn {free_gb():.1f} GB (< {a.min_free_gb:g} GB) → tạm ngừng cào")
             time.sleep(300); continue
-        for fid in due_gallery_retries(st):  # #1081: places whose gallery failed earlier
-            ent = st["gallery_retry"][fid]
+        for fid in due_gallery_retries(b):  # #1081: places whose gallery failed earlier
+            ent = b["gallery_retry"][fid]
             print(f"  ↻ thử lại ảnh #{fid} (lần {ent['tries'] + 1})", flush=True)
-            if process_item(c, ent["item"], a, st, pusher, retry=True) == "ok":
+            if process_item(c, ent["item"], a, b, pusher, retry=True) == "ok":
                 n += 1
             _save_state(st, stp)
-        kw = slice_kw(st)
+        kw = slice_kw(b)
         try:
             items, total = list_page(c, page, **kw) if kw else list_page(c, page)
         except ConnectTimeoutGiveUp as e:
-            page = skip_timeout_page(st, page, e)
-            _save_state(st, stp); hb("position", _where(page, a.parity, st))
+            page = skip_timeout_page(b, page, e)
+            st_city_sync_page(st, b, page)
+            _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
             continue
-        print(f"trang {page}{' ' + str(kw) if kw else ''}: {len(items)} quán (tổng {total})", flush=True)
+        print(f"[{st.get('city')}] trang {page}{' ' + str(kw) if kw else ''}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
-            action, nxt, wait = plan_empty_page(st, page, total)
-            if action == "end" and next_slice(st, lambda: _build_slices_live(c)):
-                kw = slice_kw(st)
-                print(f"hết lát hiện tại (API chỉ trả tối đa {LIST_CAP} quán/lượt) -> sang lát {st['slice']}/"
-                      f"{len(st['slices'])} {kw}", flush=True)
+            action, nxt, wait = plan_empty_page(b, page, total)
+            if action == "end" and next_slice(b, lambda: _build_slices_live(c)):
+                kw = slice_kw(b)
+                print(f"hết lát hiện tại (API chỉ trả tối đa {LIST_CAP} quán/lượt) -> sang lát {b['slice']}/"
+                      f"{len(b['slices'])} {kw}", flush=True)
                 wait = 0
             elif action == "end":
-                print(f"hết danh sách (trang {page} > tổng {st.get('total')}), nghỉ {int(wait // 60)} phút rồi quét lại từ trang 1", flush=True)
+                # City sweep finished -> next city (preserve HCM progress in its own bucket).
+                order = st.get("city_order") or [st.get("city") or CITY]
+                slug, wrapped = cities_mod.advance_city(st, order)
+                if slug and slug in by_slug:
+                    c.set_city(by_slug[slug])
+                b = _active_bucket(st)
+                page = 1; b["page"] = 1; b.pop("slices", None); b["slice"] = 0; b.pop("total", None)
+                msg = (f"hết tỉnh/thành, nghỉ {int(END_PAUSE // 60)} phút rồi quét lại từ {slug}"
+                       if wrapped else f"xong city trước -> sang {slug}")
+                print(msg, flush=True)
+                wait = END_PAUSE if wrapped else 2
+                nxt = 1
             elif action == "retry":
-                print(f"trang {page} trống/không có tổng (đã biết tổng {st.get('total')}) -> thử lại sau {int(wait)}s "
-                      f"(lần {st['list_retry']}/{LIST_RETRIES}), KHÔNG quay về trang 1", flush=True)
+                print(f"trang {page} trống/không có tổng (đã biết tổng {b.get('total')}) -> thử lại sau {int(wait)}s "
+                      f"(lần {b['list_retry']}/{LIST_RETRIES}), KHÔNG quay về trang 1", flush=True)
             else:
                 hb("empty_page", str(page))
                 print(f"trang {page} vẫn trống sau {LIST_RETRIES} lần -> bỏ qua, sang trang {nxt}"
                       + (f"; nhiều trang liền bị bỏ, nghỉ {int(wait // 60)} phút" if wait else ""), flush=True)
-            page = nxt; st["page"] = page; _save_state(st, stp); hb("position", _where(page, a.parity, st))
+            page = nxt; b["page"] = page; _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
             if wait: time.sleep(wait)
             continue
-        note_page_ok(st, total); hb("page_ok")
+        note_page_ok(b, total); hb("page_ok")
         for it in items:
             if a.limit and n >= a.limit:
                 break
             fid = str(it["Id"])
             if a.parity != "all" and (int(fid) % 2 == 1) != (a.parity == "odd"):
                 continue
-            if fid in st["done"] and not a.refetch:
+            if fid in b["done"] and not a.refetch:
                 continue
-            if fid in (st.get("gallery_retry") or {}):
+            if fid in (b.get("gallery_retry") or {}):
                 continue  # waits for its own backoff slot
-            if process_item(c, it, a, st, pusher) in ("ok", "none"):
+            if process_item(c, it, a, b, pusher) in ("ok", "none"):
                 n += 1
             _save_state(st, stp)
-        page += 1; st["page"] = page
-        _save_state(st, stp); hb("position", _where(page, a.parity, st))
+        page += 1; b["page"] = page
+        _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
     return n
+
+
+def st_city_sync_page(st, b, page):
+    b["page"] = page
 
 
 def skip_timeout_page(st, page, exc):
@@ -779,10 +872,16 @@ def _build_slices_live(c):
 
 
 def _save_state(st, stp):
+    # Mirror the active city bucket to top-level keys so older tools/tests that read page/done still work.
+    b = _active_bucket(st)
+    for k in ("page", "done", "failed", "total", "slices", "slice", "list_retry", "skip_streak",
+              "skipped_pages", "gallery_retry", "gallery_failed", "timeout_skipped"):
+        if k in b:
+            st[k] = b[k]
     if os.path.exists(stp):
         try: os.replace(stp, stp + ".bak")
         except OSError: pass
-    tmp = stp + ".tmp"; json.dump(st, open(tmp, "w", encoding="utf-8")); os.replace(tmp, stp)
+    tmp = stp + ".tmp"; json.dump(st, open(tmp, "w", encoding="utf-8"), ensure_ascii=False); os.replace(tmp, stp)
 
 
 if __name__ == "__main__":

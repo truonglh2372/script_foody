@@ -37,10 +37,13 @@ from aqd_api import APIError  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 
 SERVER_COORD_CODES = ("import_coordinates_out_of_range", "import_coordinates_required")  # server 422s (#1452)
+# Permanent import 422s: log once to _bad_import.json and never POST again (stops push spam).
+SERVER_PERMANENT_CODES = SERVER_COORD_CODES + ("opening_periods_invalid",)
 
 ROOT = fu.ROOT; EP = fu.EP
 UP = os.path.join(ROOT, "_uploaded.json"); CL = os.path.join(ROOT, "_cleaned.json")
-BAD = os.path.join(ROOT, "_bad_coords.json")  # fid -> {problems, lat, lng, name, url}: not sent, needs a corrected point
+BAD = os.path.join(ROOT, "_bad_import.json")  # fid -> permanent reject; also merges legacy _bad_coords.json
+BAD_LEGACY = os.path.join(ROOT, "_bad_coords.json")
 RP = os.path.join(ROOT, "_reviews_pushed.json")  # fid -> [review source_id đã lên server]
 REV = os.path.join(ROOT, "_reviews_pending.jsonl")
 _lock = threading.Lock()
@@ -78,11 +81,16 @@ class Pusher:
         self.api = AQD()
         self.done = _read(UP, {}); self.cleaned = _read(CL, {}); self.rpushed = _read(RP, {})
         self.bad = _read(BAD, {})
+        # Merge legacy _bad_coords.json once so older permanent coord rejects stay skipped.
+        for k, v in _read(BAD_LEGACY, {}).items():
+            self.bad.setdefault(k, v)
         self.q = queue.Queue(); self.stats = {"reviews": 0, "pushed": 0, "photos": 0, "deleted_files": 0, "freed_bytes": 0, "fail": 0}
 
     def _save(self):
         with _lock:
             _write(UP, self.done); _write(CL, self.cleaned); _write(RP, self.rpushed); _write(BAD, self.bad)
+            # Keep legacy filename for older admin scripts / tests that still open _bad_coords.json.
+            _write(BAD_LEGACY, self.bad)
 
     def append_reviews(self, fid, p):
         seen = set()
@@ -96,12 +104,17 @@ class Pusher:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     def flag_bad_coords(self, fid, p, problems):
-        """Record (once per distinct problem) a place whose point is missing or invalid; it is never sent as 0 / garbage."""
-        entry = {"problems": problems, "lat": p.get("lat"), "lng": p.get("lng"), "name": p.get("name"),
-                 "url": p.get("source_url") or p.get("url"), "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        if (self.bad.get(fid) or {}).get("problems") != problems:
-            print(f"  [coords ✗] #{fid} {p.get('name')}: {','.join(problems)} (lat={p.get('lat')}, lng={p.get('lng')}) -> không gửi, "
-                  f"ghi _bad_coords.json", flush=True)
+        """Alias kept for tests; same as flag_bad_import."""
+        return self.flag_bad_import(fid, p, problems)
+
+    def flag_bad_import(self, fid, p, problems):
+        """Record a permanent import reject; never POST this fid again. Written to _bad_import.json for admin review."""
+        entry = {"problems": list(problems), "lat": p.get("lat"), "lng": p.get("lng"), "name": p.get("name"),
+                 "url": p.get("source_url") or p.get("url"), "city": p.get("city"),
+                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        if (self.bad.get(fid) or {}).get("problems") != entry["problems"]:
+            print(f"  [import ✗] #{fid} {p.get('name')}: {','.join(problems)} -> ghi _bad_import.json, không POST lại",
+                  flush=True)
             self.bad[fid] = entry; self._save()
 
     def push(self, fid):
@@ -109,20 +122,24 @@ class Pusher:
         p = load_place(fid)
         if p is None:
             return False
+        prev = self.bad.get(fid) or {}
+        prev_probs = prev.get("problems") or []
+        if prev and any(str(x).startswith("server_") for x in prev_probs):
+            return False  # server permanent 422 — never re-POST
         body, ph = fu.payload(p), fu.photos_of(p)
         bad = fu.problems(body)
         if bad:
-            self.flag_bad_coords(fid, p, bad)
+            self.flag_bad_import(fid, p, bad)
             return False
-        if self.bad.pop(fid, None):  # a re-fetch brought a valid point
-            self._save()
+        if prev:  # client-side reject cleared by a re-fetch with a valid payload
+            self.bad.pop(fid, None); self._save()
         rec = self.done.get(fid) or {}
         if not rec.get("restaurant_id"):
             try:
                 r = self.api.call("POST", EP, json_body=body)
-            except APIError as e:  # an_uong_quanh_day#1452: server guard, a retry can never succeed
-                if e.status == 422 and e.code in SERVER_COORD_CODES:
-                    self.flag_bad_coords(fid, p, ["server_" + e.code])
+            except APIError as e:  # permanent server 422s: never succeed on retry
+                if e.status == 422 and e.code in SERVER_PERMANENT_CODES:
+                    self.flag_bad_import(fid, p, ["server_" + e.code])
                     return False
                 raise
             if not isinstance(r, dict) or not r.get("restaurant_id"):
