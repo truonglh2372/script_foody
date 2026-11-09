@@ -112,5 +112,68 @@ class ActiveBucketTest(unittest.TestCase):
         self.assertEqual(b.get("done"), {})
 
 
+
+class DistrictSlicesTest(unittest.TestCase):
+    def test_build_slices_uses_provided_district_ids(self):
+        # Simulate Hà Nội-like ids (20+) and a high id (690) that the 1..80 probe would miss.
+        totals = {
+            (20, ""): 100,
+            (21, ""): 2500,  # over LIST_CAP -> split by cate
+            (690, ""): 50,
+            ("", 1): 10,
+            (21, 1): 40,
+        }
+        def total_of(d, k):
+            return totals.get((d, k), 0)
+        out = ff.build_slices(total_of, cap=2000, max_id=80, district_ids=[20, 21, 690])
+        districts = {s["district"] for s in out}
+        self.assertEqual(districts, {20, 21, 690})
+        # 21 over cap -> cate slice
+        self.assertTrue(any(s["district"] == 21 and s["cate"] == 1 for s in out))
+        # probe fallback still works without district_ids (legacy)
+        out2 = ff.build_slices(total_of, cap=2000, max_id=25)
+        self.assertIn(20, {s["district"] for s in out2})
+        self.assertNotIn(690, {s["district"] for s in out2})
+
+    def test_fetch_district_ids_parses_api(self):
+        class FakeClient:
+            city = "ha-noi"
+            city_id = 218
+            def json(self, path, referer=None):
+                self.last = path
+                return {"data": [{"Id": 20, "Name": "Ba Đình"}, {"Id": 690, "Name": "Bắc Từ Liêm"},
+                                 {"Id": 20, "Name": "dup"}]}
+        c = FakeClient()
+        ids = ff.fetch_district_ids(c)
+        self.assertEqual(ids, [20, 690])
+        self.assertIn("GetDistrictsByProvinceId", c.last)
+        self.assertIn("provinceId=218", c.last)
+
+
+class SkipCitiesTest(unittest.TestCase):
+    def test_resolve_and_skip_preserves_hcm_bucket(self):
+        st = fc.migrate_state({"page": 9, "done": {"1": "x"}, "failed": {}, "slice": 3,
+                               "slices": [{"district": 1, "cate": "", "total": 10}]})
+        st["city_order"] = ["ho-chi-minh", "ha-noi", "da-nang"]
+        fc.ensure_city_bucket(st, "ha-noi")
+        fc.ensure_city_bucket(st, "da-nang")
+        st["city"] = "ho-chi-minh"
+        st["city_index"] = 0
+        skip = fc.resolve_skip_cities(st, cli="ho-chi-minh", env=None, seed=fc.seed_cities())
+        self.assertEqual(skip, {"ho-chi-minh"})
+        self.assertEqual(st["skip_cities"], ["ho-chi-minh"])
+        slug, wrapped = fc.skip_current_cities(st, st["city_order"], skip)
+        self.assertEqual(slug, "ha-noi")
+        self.assertFalse(wrapped)
+        # HCM bucket untouched
+        self.assertEqual(st["cities"]["ho-chi-minh"]["page"], 9)
+        self.assertEqual(st["cities"]["ho-chi-minh"]["done"], {"1": "x"})
+        self.assertEqual(st["cities"]["ho-chi-minh"]["slice"], 3)
+
+    def test_skip_by_id(self):
+        st = {"schema": 2, "cities": {}, "city_order": ["ho-chi-minh", "ha-noi"], "city": "ho-chi-minh", "city_index": 0}
+        skip = fc.resolve_skip_cities(st, cli="217", env=None, seed=fc.seed_cities())
+        self.assertEqual(skip, {"ho-chi-minh"})
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

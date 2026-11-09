@@ -171,3 +171,60 @@ def advance_city(st, city_order):
     st["city"] = slug
     ensure_city_bucket(st, slug)
     return slug, wrapped
+
+
+def parse_skip_cities(raw):
+    """Comma slugs/ids -> lowercased slug set. Empty/None -> empty set."""
+    if not raw:
+        return set()
+    return {p.strip().lower() for p in str(raw).split(",") if p.strip()}
+
+
+def resolve_skip_cities(st, cli=None, env=None, seed=None):
+    """Merge skip lists from CLI/env/state into st["skip_cities"] (slugs). Keep HCM bucket intact.
+    Accepts slugs or numeric ids (matched against seed cities)."""
+    seed = seed if seed is not None else seed_cities()
+    id_to_slug = {str(c["id"]): c["slug"] for c in seed}
+    slug_set = {c["slug"].lower() for c in seed}
+
+    def norm(parts):
+        out = set()
+        for p in parts:
+            p = p.strip().lower()
+            if not p:
+                continue
+            if p.isdigit():
+                slug = id_to_slug.get(p)
+                if slug:
+                    out.add(slug)
+            elif p in slug_set:
+                out.add(p)
+            else:
+                # still record unknown slug so operators can see it
+                out.add(p)
+        return out
+
+    merged = set()
+    for raw in (cli, env, ",".join(st.get("skip_cities") or [])):
+        merged |= norm(parse_skip_cities(raw))
+    # persist for restarts (do not delete city buckets)
+    st["skip_cities"] = sorted(merged)
+    return merged
+
+
+def skip_current_cities(st, city_order, skip):
+    """Advance past cities in `skip`. Returns (slug, wrapped_any). Preserves buckets."""
+    if not skip:
+        return st.get("city"), False
+    order = st.get("city_order") or city_order
+    if not order:
+        return None, True
+    wrapped_any = False
+    seen = 0
+    while st.get("city") in skip and seen <= len(order):
+        slug, wrapped = advance_city(st, order)
+        wrapped_any = wrapped_any or wrapped
+        seen += 1
+        if wrapped and st.get("city") in skip and seen >= len(order):
+            break
+    return st.get("city"), wrapped_any

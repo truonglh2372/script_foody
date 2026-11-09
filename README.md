@@ -28,8 +28,11 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 | `AQD_FOODY_GALLERY_RETRY_PER_PAGE` | số quán chờ thử lại ảnh xử lý trước mỗi trang danh sách (#1081) | `3` |
 | `AQD_FOODY_ROOT` | thư mục cài | `~/script_foody`, `C:\script_foody` |
 | `AQD_FOODY_CITIES` | tỉnh/thành để cào: `all` (mặc định) hoặc danh sách slug/id cách nhau bởi dấu phẩy (`ha-noi,da-nang`) | `all` |
+| `AQD_FOODY_SKIP_CITIES` | slug/id bỏ qua trong lượt này (giữ nguyên bucket state, ví dụ `ho-chi-minh` khi HCM đã xong) | (trống) |
 | `AQD_FOODY_SINGLE_CITY` | `1` = chỉ cào `AQD_FOODY_CITY` (giữ hành vi cũ một tỉnh) | tắt |
 | `AQD_FOODY_VERIFY_CITIES` | `1` = probe Foody để bỏ slug chết, ghi `foody_data/_cities.json` | tắt |
+
+Lát (district×cate) lấy `districtId` từ `/__get/Common/GetDistrictsByProvinceId` theo province (id toàn cục, không phải 1..N mỗi tỉnh). `AQD_FOODY_SKIP_CITIES` / `--skip-cities` bỏ qua tỉnh đã xong mà không xoá state.
 
 Tiến độ multi-city nằm trong `_state.json` (`schema: 2`, bucket theo từng city). State HCM cũ được nâng cấp tự động, không mất `done`. Import 422 vĩnh viễn (`opening_periods_invalid`, `import_coordinates_out_of_range`, …) ghi vào `foody_data/_bad_import.json` và không POST lại.
 
