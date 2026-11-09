@@ -27,6 +27,12 @@ Biến tuỳ chọn (đặt trước lệnh, ví dụ `AQD_FOODY_LIMIT=0 bash` /
 | `AQD_FOODY_GALLERY_TRIES` / `AQD_FOODY_GALLERY_BACKOFF` / `AQD_FOODY_GALLERY_BACKOFF_MAX` | album ảnh lỗi: số lần thử lại, giây chờ đầu, trần (#1081) | `5` / `900` / `21600` |
 | `AQD_FOODY_GALLERY_RETRY_PER_PAGE` | số quán chờ thử lại ảnh xử lý trước mỗi trang danh sách (#1081) | `3` |
 | `AQD_FOODY_ROOT` | thư mục cài | `~/script_foody`, `C:\script_foody` |
+| `AQD_FOODY_CITIES` | tỉnh/thành để cào: `all` (mặc định) hoặc danh sách slug/id cách nhau bởi dấu phẩy (`ha-noi,da-nang`) | `all` |
+| `AQD_FOODY_SINGLE_CITY` | `1` = chỉ cào `AQD_FOODY_CITY` (giữ hành vi cũ một tỉnh) | tắt |
+| `AQD_FOODY_VERIFY_CITIES` | `1` = probe Foody để bỏ slug chết, ghi `foody_data/_cities.json` | tắt |
+
+Tiến độ multi-city nằm trong `_state.json` (`schema: 2`, bucket theo từng city). State HCM cũ được nâng cấp tự động, không mất `done`. Import 422 vĩnh viễn (`opening_periods_invalid`, `import_coordinates_out_of_range`, …) ghi vào `foody_data/_bad_import.json` và không POST lại.
+
 
 Dừng: tạo file `foody_data/STOP`. Log: `foody_data/fetch.log`.
 

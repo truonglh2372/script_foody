@@ -148,12 +148,14 @@ class ListPaging(unittest.TestCase):  # #1080
                 mock.patch.object(ff, "LIST_SKIP_STREAK", 99), mock.patch.object(ff, "LIST_CAP", 10 ** 9):
             ff.main(["--limit", "0", "--no-push", "--parity", "even"])
         self.assertTrue(sent[0].startswith("▶️ *foody @ Admin* — bắt đầu chạy"), sent[0])
-        self.assertIn("Tiếp tục từ: foody page 531, parity even (tổng list 37.208)", sent[0])
+        self.assertIn("Tiếp tục từ: foody page 531,", sent[0])
+        self.assertIn("parity even (tổng list 37.208)", sent[0])
         red = [x for x in sent if x.startswith("🔴")]
         self.assertEqual(len(red), 1)
         self.assertIn("10 trang list liên tiếp trả \"0 quán\" (531→540)", red[0])
         self.assertTrue(sent[-1].startswith("⚫ *foody @ Admin* — đã dừng (thấy file STOP)"), sent[-1])
-        self.assertIn("Dừng tại: foody page 541, parity even", sent[-1])
+        self.assertIn("Dừng tại: foody page 541,", sent[-1])
+        self.assertIn("parity even", sent[-1])
 
 class ListCap(unittest.TestCase):
     """Root cause of "trang N: 0 quán" forever: HomeListPlace returns at most 2000 items per query (count=12 ->
