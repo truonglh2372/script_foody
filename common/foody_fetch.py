@@ -541,14 +541,49 @@ def plan_empty_page(st, page, total, page_size=PAGE_SIZE, retries=None, backoff=
     return "skip", page + 1, 0
 
 
-def build_slices(total_of, cap=None, max_id=None):
+def fetch_district_ids(c):
+    """Foody district ids for the client's current province via GetDistrictsByProvinceId.
+    These ids are global (HCM≈1..19, Hà Nội≈20..29+690+, Bắc Kạn≈198+), NOT 1..N per city.
+    Returns a list of int ids, or [] on failure (caller may fall back to probing)."""
+    cid = int(getattr(c, "city_id", CITY_ID) or CITY_ID)
+    path = f"/__get/Common/GetDistrictsByProvinceId?provinceId={cid}&t={int(time.time() * 1000)}"
+    try:
+        data = c.json(path, referer=f"/{getattr(c, 'city', CITY)}/o-dau")
+    except Exception as e:
+        print(f"  ! GetDistrictsByProvinceId provinceId={cid}: {type(e).__name__}: {e}", flush=True)
+        return []
+    rows = (data or {}).get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for row in rows:
+        try:
+            did = int(row.get("Id") if isinstance(row, dict) else row)
+        except (TypeError, ValueError):
+            continue
+        if did > 0:
+            out.append(did)
+    # stable unique order as Foody returned
+    seen, uniq = set(), []
+    for d in out:
+        if d not in seen:
+            seen.add(d); uniq.append(d)
+    return uniq
+
+
+def build_slices(total_of, cap=None, max_id=None, district_ids=None):
     """Slices of the city list that each fit under the API cap. total_of(district, cate) -> Total (int or None).
-    Districts under the cap are one slice; a district over it is split by every cateId seen city-wide."""
+    Districts under the cap are one slice; a district over it is split by every cateId seen city-wide.
+    Prefer `district_ids` from GetDistrictsByProvinceId; otherwise probe 1..max_id (HCM-only legacy)."""
     cap = LIST_CAP if cap is None else cap
     max_id = SLICE_MAX_ID if max_id is None else max_id
+    if district_ids:
+        districts = [int(d) for d in district_ids if int(d) > 0]
+    else:
+        districts = list(range(1, max_id + 1))
     cates = [k for k in range(1, max_id + 1) if (total_of("", k) or 0) > 0]
     out = []
-    for d in range(1, max_id + 1):
+    for d in districts:
         t = total_of(d, "") or 0
         if t <= 0:
             continue
@@ -674,6 +709,9 @@ def main(argv=None):
                     help="chia việc 2 máy theo Foody id: odd (Mac) / even (Admin)")
     ap.add_argument("--cities", default=None,
                     help="all (mặc định) hoặc danh sách slug/id cách nhau bởi dấu phẩy; ghi đè AQD_FOODY_CITIES")
+    ap.add_argument("--skip-cities", default=None,
+                    help="slug/id cách nhau bởi dấu phẩy để BỎ QUA trong lượt này (giữ state); "
+                         "ghi đè/ghép với AQD_FOODY_SKIP_CITIES và st['skip_cities']")
     a = ap.parse_args(argv)
     os.makedirs(ROOT, exist_ok=True)
     global HB
@@ -712,6 +750,19 @@ def main(argv=None):
         st["city"] = st["city_order"][0]
     else:
         st["city_index"] = st["city_order"].index(st["city"])
+    skip = cities_mod.resolve_skip_cities(
+        st, cli=getattr(a, "skip_cities", None),
+        env=os.environ.get("AQD_FOODY_SKIP_CITIES"),
+        seed=city_rows,
+    )
+    if skip:
+        before = st.get("city")
+        cities_mod.skip_current_cities(st, st["city_order"], skip)
+        if st.get("city") != before:
+            print(f"[skip] bỏ qua {sorted(skip)}; từ {before} -> {st.get('city')} "
+                  f"(state city cũ giữ nguyên trong cities[])", flush=True)
+        else:
+            print(f"[skip] danh sách bỏ qua={sorted(skip)}; đang ở {st.get('city')}", flush=True)
     bucket = cities_mod.ensure_city_bucket(st, st["city"])
     pusher = None
     if not a.no_push:
@@ -719,9 +770,12 @@ def main(argv=None):
         pusher = Pusher().start()
     page = a.start_page or bucket.get("page", 1)
     c, n = Client(), 0
+    if st["city"] not in by_slug:
+        raise SystemExit(f"city hiện tại {st.get('city')!r} không có trong danh sách (skip hết?)")
     c.set_city(by_slug[st["city"]])
     print(f"parity={a.parity} city={st['city']} ({st['city_index']+1}/{len(st['city_order'])}) "
-          f"page={page} known_total={bucket.get('total')} cities={len(st['city_order'])}", flush=True)
+          f"page={page} known_total={bucket.get('total')} cities={len(st['city_order'])} "
+          f"skip={sorted(skip) or '-'}", flush=True)
     hb("position", _where(page, a.parity, st, bucket))
     hb("start", "foody_fetch.py " + " ".join(sys.argv[1:] if argv is None else argv))
     if pusher:  # reviews / uploads come from the pusher thread's running totals
@@ -801,9 +855,13 @@ def _crawl(a, st, stp, pusher, c, page):
                       f"{len(b['slices'])} {kw}", flush=True)
                 wait = 0
             elif action == "end":
-                # City sweep finished -> next city (preserve HCM progress in its own bucket).
+                # City sweep finished -> next city (preserve prior city progress in its own bucket).
                 order = st.get("city_order") or [st.get("city") or CITY]
+                skip = set(st.get("skip_cities") or [])
                 slug, wrapped = cities_mod.advance_city(st, order)
+                if slug in skip:
+                    slug, wrapped2 = cities_mod.skip_current_cities(st, order, skip)
+                    wrapped = wrapped or wrapped2
                 if slug and slug in by_slug:
                     c.set_city(by_slug[slug])
                 b = _active_bucket(st)
@@ -865,9 +923,17 @@ def _build_slices_live(c):
             return list_page(c, 1, district=d, cate=k)[1]
         except Exception:
             return None
-    print(f"dựng danh sách lát (quận x loại, mỗi lát <= {LIST_CAP} quán)...", flush=True)
-    out = build_slices(total_of)
+    districts = fetch_district_ids(c)
+    if districts:
+        print(f"dựng danh sách lát từ {len(districts)} quận/huyện Foody "
+              f"(provinceId={getattr(c, 'city_id', '?')}, mỗi lát <= {LIST_CAP} quán)...", flush=True)
+        out = build_slices(total_of, district_ids=districts)
+    else:
+        print(f"dựng danh sách lát (fallback probe 1..{SLICE_MAX_ID}, mỗi lát <= {LIST_CAP} quán)...", flush=True)
+        out = build_slices(total_of)
     print(f"  {len(out)} lát, tổng {sum(x['total'] for x in out)} quán", flush=True)
+    if not out:
+        print("  ! 0 lát — city này sẽ được bỏ qua (không có district/cate trả Total>0)", flush=True)
     return out
 
 
