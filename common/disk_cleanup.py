@@ -17,7 +17,8 @@ CHỈ xoá thứ tạo lại được:
 KHÔNG BAO GIỜ xoá: json/jsonl dữ liệu, quán chưa SAFE_DONE / chưa _cleaned, crawler.env, creds.env, *.env, file secret,
 chrome-profile, profile đăng nhập, venv, .git, bak/.
 Mỗi lần dọn thật CÓ giải phóng: một dòng Slack qua slack_notify (#1388). Dọn 0 file -> không gửi; nếu ổ thấp thì
-tối đa 1 cảnh báo / AQD_CLEANUP_ALERT_H (6) giờ, kèm top thư mục chiếm ổ ngoài phạm vi crawler (docker, home).
+tối đa 1 cảnh báo / AQD_CLEANUP_ALERT_H (6) giờ, kèm thứ chiếm ổ ngoài phạm vi crawler (docker, thư mục lớn nhất đo
+bằng os.scandir - chạy được trên Windows, pagefile/hiberfil/swapfile, process ngốn RAM; xem host_usage.py).
 AQD_CLEANUP_DOCKER=1 (mặc định tắt): khi ổ thấp chạy thêm `docker builder prune --filter until=72h` và
 `docker image prune -f` (chỉ image dangling). KHÔNG BAO GIỜ prune volume. --dry-run: chỉ liệt kê, không xoá, không gửi Slack.
 """
@@ -61,24 +62,24 @@ def docker_prune(env, say=print, runner=None):
     return True
 
 
-def top_space_users(runner=None, limit=6):
-    """Văn bản ngắn: docker system df + thư mục lớn nhất trong home (bỏ qua nếu không có lệnh)."""
+def top_space_users(runner=None, root=None, env=None, space=None):
+    """Văn bản ngắn: docker system df + thứ chiếm ổ/RAM. Phần thư mục đo bằng host_usage.report (os.scandir, chạy
+    được cả Windows - trước đây `du` chỉ chạy trên Mac/Linux nên Admin không có gì), kèm pagefile.sys/hiberfil.sys/
+    swapfile.sys trên Windows và process ngốn RAM nhất."""
     runner = runner or (lambda a: _cmd(a, 180))
     out = []
     df = runner(["docker", "system", "df", "--format", "{{.Type}} {{.Size}} (thu hồi {{.Reclaimable}})"]).strip()
     if df:
         out.append("docker: " + "; ".join(df.splitlines()))
-    home = os.path.expanduser("~")
-    du = runner(["du", "-xhd1", home]) if os.name != "nt" else ""
-    def key(line):
-        v = line.split("\t")[0].strip(); m = {"K": 1, "M": 2 ** 10, "G": 2 ** 20, "T": 2 ** 30}
-        try:
-            return float(v[:-1]) * m.get(v[-1], 0)
-        except (ValueError, IndexError):
-            return 0
-    rows = sorted((l for l in du.splitlines() if "\t" in l and l.split("\t")[1] != home), key=key, reverse=True)[:limit]
-    if rows:
-        out.append("home: " + ", ".join(f"{os.path.basename(l.split(chr(9))[1])} {l.split(chr(9))[0].strip()}" for l in rows))
+    if space is None:
+        import host_usage
+        space = host_usage.report
+    try:
+        rep = space(root or os.path.expanduser("~"), env)
+    except Exception as e:  # noqa: BLE001 - the alert still goes out
+        rep = f"không đo được ({type(e).__name__})"
+    if rep and rep != "không đo được":
+        out.append(rep)
     return " · ".join(out) or "không đo được"
 
 
@@ -337,7 +338,7 @@ def run(crawler, root, dry_run=False, force=False, now=None, notifier=None, env=
                 st["last_alert"] = now
                 with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f)
                 os.replace(tmp, stp)
-                ok = notifier.disk_low_nothing(after, top_space_users())
+                ok = notifier.disk_low_nothing(after, top_space_users(root=root, env=os.environ if env is None else env))
             else:
                 ok = notifier.cleanup(freed, files, after, trigger)
             res = getattr(notifier, "last_result", None) or ("ok" if ok else "lỗi")

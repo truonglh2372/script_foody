@@ -248,7 +248,8 @@ class SlackResultLoggedTest(unittest.TestCase):
 
 class QuietTest(unittest.TestCase):
     def test_nothing_freed_no_slack_and_low_alert_once_per_6h(self):
-        dc.top_space_users = lambda: "docker 40GB"
+        real = dc.top_space_users; self.addCleanup(lambda: setattr(dc, "top_space_users", real))
+        dc.top_space_users = lambda **k: "docker 40GB"
         with tempfile.TemporaryDirectory() as r:
             n = FakeNotifier(); e = {"AQD_CLEANUP_MIN_FREE_GB": "1e9"}
             dc.run("gmaps", r, force=True, now=NOW, notifier=n, env={"AQD_CLEANUP_MIN_FREE_GB": "0"}, say=lambda s: None)
@@ -265,6 +266,92 @@ class QuietTest(unittest.TestCase):
         self.assertFalse(dc.docker_prune({}, say=lambda s: None, runner=seen.append)); self.assertEqual(seen, [])
         self.assertTrue(dc.docker_prune({"AQD_CLEANUP_DOCKER": "1"}, say=lambda s: None, runner=seen.append))
         self.assertTrue(seen and all("volume" not in a for a in seen))
+
+
+
+# ---- Windows space report (host_usage.py, same file as script_google_map/common) ----------------------------------
+import ntpath  # noqa: E402
+import host_usage as hu  # noqa: E402
+
+GB = 1024 ** 3
+
+
+class _St:
+    def __init__(self, size=0, attrs=0):
+        self.st_size, self.st_file_attributes = size, attrs
+
+
+class _Entry:
+    def __init__(self, parent, name, kind, size=0, attrs=0):
+        self.name, self.path, self.kind = name, ntpath.join(parent, name), kind
+        self._st = _St(size, attrs | (0x10 if kind == "d" else 0x20))
+
+    def is_dir(self, follow_symlinks=True):
+        return self.kind == "d"
+
+    def is_symlink(self):
+        return False
+
+    def stat(self, follow_symlinks=True):
+        return self._st
+
+
+def fake_scandir(tree, opened):
+    def scandir(path):
+        opened.append(path)
+        if path not in tree:
+            raise PermissionError(path)
+        entries = [_Entry(path, *row) for row in tree[path]]
+
+        class _It:
+            def __iter__(s):
+                return iter(entries)
+
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+        return _It()
+    return scandir
+
+
+TREE = {"C:\\": [("Users", "d"), ("pagefile.sys", "f", 12 * GB), ("swapfile.sys", "f", GB // 4),
+                 ("Documents and Settings", "d", 0, 0x400), ("script_foody", "d")],
+        "C:\\Users": [("Admin", "d")], "C:\\Users\\Admin": [("Downloads", "d")],
+        "C:\\Users\\Admin\\Downloads": [("x.iso", "f", 7 * GB)],
+        "C:\\script_foody": [("foody_data", "d")], "C:\\script_foody\\foody_data": [("a.jpg", "f", GB)],
+        "C:\\Documents and Settings": [("loop", "d")]}
+
+
+class WindowsSpaceTest(unittest.TestCase):
+    def test_windows_report_and_no_du(self):
+        opened, calls = [], []
+        sizes = {"C:\\pagefile.sys": 12 * GB, "C:\\swapfile.sys": GB // 4}
+
+        def stat(p):
+            if p not in sizes:
+                raise FileNotFoundError(p)
+            return _St(sizes[p])
+        text = hu.report("C:\\script_foody", env={"USERPROFILE": "C:\\Users\\Admin"}, is_win=True,
+                         scandir=fake_scandir(TREE, opened), stat=stat,
+                         runner=lambda a, timeout=30: calls.append(a) or '"chrome.exe","1","C","1","2.097.152 K"\n')
+        self.assertIn("hệ thống: pagefile.sys 12,0 GB, swapfile.sys 256,0 MB", text)
+        self.assertIn("C:\\: pagefile.sys 12,0 GB, Users 7,0 GB", text)
+        self.assertIn("C:\\script_foody: foody_data 1,0 GB", text)
+        self.assertIn("RAM: chrome.exe 2,0 GB", text)
+        self.assertNotIn("C:\\Documents and Settings", opened)
+        self.assertEqual([a[0] for a in calls], ["tasklist"])
+
+    def test_top_space_users_uses_scandir_report_not_du(self):
+        seen = []
+        txt = dc.top_space_users(runner=lambda a: seen.append(a) or "", root="C:\\script_foody", env={},
+                                 space=lambda root, env: f"C:\\: Users 7,0 GB ({root})")
+        self.assertEqual(txt, "C:\\: Users 7,0 GB (C:\\script_foody)")
+        self.assertFalse(any(a[0] == "du" for a in seen))
+        txt = dc.top_space_users(runner=lambda a: "Images 3GB" if a[0] == "docker" else "", root="/x", env={},
+                                 space=lambda root, env: "không đo được")
+        self.assertEqual(txt, "docker: Images 3GB")
 
 
 if __name__ == "__main__":
