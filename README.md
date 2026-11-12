@@ -70,6 +70,7 @@ Crawler chết thì không tự báo được; người xem thấy qua "Báo cá
 - Windows (Task Scheduler, cần đã cài chế độ chạy hết → có `Startup\aqd_foody.cmd`): `powershell -ExecutionPolicy Bypass -File windows\install_watchdog.ps1` · gỡ: thêm `-Uninstall`.
 - Mac (launchd `aqd.watchdog.foody`, cần đã có `aqd.foody`): `sh mac/install_watchdog.sh` · gỡ: `sh mac/install_watchdog.sh --uninstall`.
 - Dừng có chủ đích: tạo `foody_data/STOP` trước (watchdog thấy STOP thì không khởi động lại).
+- `Startup\aqd_foody.cmd` (do `windows\install.ps1` ghi; chạy lúc đăng nhập và khi watchdog khởi động lại) trước khi chạy gọi `windows\foody_running.ps1`: chỉ tính **process python thật** đang chạy `foody_fetch.py` của root này (truy vấn CIM `Name like 'python%'`, bỏ qua chính lệnh kiểm tra và process cmd/powershell cha), giống `start_fetcher.ps1` của script_google_map. Đang chạy → không mở thêm; không chạy / không đọc được danh sách process → chạy foody. Log: `foody_data/start_foody.log`. Quy tắc khớp có bản Python `common/foody_running.py` để test (`python3 tests/test_foody_running.py`). Máy đã cài trước bản này phải chạy lại `windows\install.ps1` (chế độ chạy hết) để ghi lại `aqd_foody.cmd`.
 
 Test offline (chỉ server Slack giả ở 127.0.0.1): `python3 tests/test_slack_notify.py`.
 
