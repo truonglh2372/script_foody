@@ -33,6 +33,7 @@ def load_creds():
 
 
 import foody_upload as fu  # noqa: E402
+import atomic_io  # noqa: E402
 from aqd_api import APIError  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 
@@ -57,9 +58,7 @@ def _read(p, default):
 
 
 def _write(p, obj):
-    tmp = p + ".tmp"
-    json.dump(obj, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    os.replace(tmp, p)
+    atomic_io.write_json_atomic(p, obj, ensure_ascii=False, indent=1)
 
 
 def load_place(fid):

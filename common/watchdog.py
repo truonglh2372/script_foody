@@ -76,7 +76,7 @@ class Watchdog:
             tmp = self.state_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(st, f)
-            os.replace(tmp, self.state_file)
+            sn._replace(tmp, self.state_file)
         except OSError:
             pass
 

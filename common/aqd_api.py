@@ -33,6 +33,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import origin_pin  # noqa: E402  AQD_ORIGIN_IP: call the origin directly, bypassing Cloudflare
+import atomic_io  # noqa: E402  os.replace with retry when Windows has the target locked
 
 ROOT = os.environ.get("AQD_ROOT", "C:/aqd").replace("\\", "/")
 BASE = os.environ.get("AQD_BASE", "https://anuongquanhday.com")
@@ -131,7 +132,7 @@ def _write_private(path, data):
     with os.fdopen(fd, "w") as f:
         json.dump(data, f)
     os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    atomic_io.replace_retry(tmp, path)
 
 
 def _read_json(path, default):
@@ -551,9 +552,7 @@ class AQD:
             if r.get("photo_id") and not r.get("skipped"):
                 rec["urls"][_url_hash(r["url"])] = {"url": r["url"], "photo_id": r["photo_id"]}
         rec["updated_at"] = _now()
-        with open(rec_path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=1)
-        os.replace(rec_path + ".tmp", rec_path)
+        atomic_io.write_json_atomic(rec_path, rec, ensure_ascii=False, indent=1)
         for role in ("cover", "logo"):
             hit = next((r for r in out if r["role"] == role and r.get("photo_id")), None)
             if hit and role not in album.get(hit["photo_id"], {}).get("roles", []):
@@ -618,9 +617,7 @@ class AQD:
 
         def save_rec():
             rec["updated_at"] = _now()
-            with open(rec_path + ".tmp", "w", encoding="utf-8") as f:
-                json.dump(rec, f, ensure_ascii=False, indent=1)
-            os.replace(rec_path + ".tmp", rec_path)
+            atomic_io.write_json_atomic(rec_path, rec, ensure_ascii=False, indent=1)
 
         # read current state once (restaurant + album + menu) in parallel
         with cf.ThreadPoolExecutor(3) as ex:
@@ -994,9 +991,7 @@ def main(argv=None):
                     data = {"id": rid, "photos": c.photos(rid)}
                 except AQDError as e:
                     data = {"id": rid, "error": str(e)}
-                with open(fn + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False)
-                os.replace(fn + ".tmp", fn)
+                atomic_io.write_json_atomic(fn, data, ensure_ascii=False)
                 print(rid, flush=True)
             out = {"ok": True}
         elif a.cmd == "fetch":

@@ -38,6 +38,9 @@ if ($Limit -eq '0') {
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 cd /d "$Root"
+rem foody da chay cho root nay thi thoi (chi xet process python that, khong tu khop chinh lenh kiem tra) - windows\foody_running.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$Root\windows\foody_running.ps1" -Root "$Root" >> "$Root\foody_data\start_foody.log" 2>&1
+if %ERRORLEVEL% EQU 0 exit /b 0
 start "" /min cmd /c ""$V" -u "$Root\common\foody_fetch.py" --limit 0 --parity $Parity >> "$Root\foody_data\fetch.log" 2>&1"
 "@ | Set-Content -Path $Cmd -Encoding ASCII
   Remove-Item (Join-Path $Startup 'aqd_foody.cmd.disabled') -Force -ErrorAction SilentlyContinue

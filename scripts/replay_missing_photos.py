@@ -232,10 +232,9 @@ def main(argv=None):
     for fid, place, _, _ in todo:
         q[fid] = {"tries": 0, "item": item_for(place, fid), "error": "replay: imported with 0 photos (#1081)",
                   "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "next_at": 0}
-    tmp = stp + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f)
-    os.replace(tmp, stp)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
+    import atomic_io  # os.replace with retry when Windows has _state.json locked (12/11 12:39:25)
+    atomic_io.write_json_atomic(stp, st)
     print(f"queued {len(todo)} places in {stp} gallery_retry; start the crawler to process them")
     return 0
 
