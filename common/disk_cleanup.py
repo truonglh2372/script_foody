@@ -28,6 +28,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+
+def _replace(src, dst):
+    """os.replace with retries while Windows has the target locked (atomic_io.replace_retry, foody 12/11 12:39:25).
+    Falls back to a plain os.replace when atomic_io.py is not next to this file (the file is shared between repos)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import atomic_io
+    except ImportError:
+        return os.replace(src, dst)
+    return atomic_io.replace_retry(src, dst)
+
 IMG = (".jpg", ".jpeg", ".png", ".webp")
 LOGS = (".log", ".out", ".err")
 TMP = (".tmp", ".part")
@@ -324,7 +337,7 @@ def run(crawler, root, dry_run=False, force=False, now=None, notifier=None, env=
         st.update(last_run=now, last_freed=freed, last_files=files)
         tmp = stp + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f)
-        os.replace(tmp, stp)
+        _replace(tmp, stp)
         alert_gap = env_num(os.environ if env is None else env, "AQD_CLEANUP_ALERT_H", 6) * 3600
         send_alert = not (freed or files) and low and now - float(st.get("last_alert") or 0) >= alert_gap
         if not (freed or files) and not send_alert:
@@ -337,7 +350,7 @@ def run(crawler, root, dry_run=False, force=False, now=None, notifier=None, env=
             if send_alert:
                 st["last_alert"] = now
                 with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f)
-                os.replace(tmp, stp)
+                _replace(tmp, stp)
                 ok = notifier.disk_low_nothing(after, top_space_users(root=root, env=os.environ if env is None else env))
             else:
                 ok = notifier.cleanup(freed, files, after, trigger)

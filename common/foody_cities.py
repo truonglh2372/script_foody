@@ -6,7 +6,7 @@ foody_data/_cities.json so a cold start does not re-probe every run.
 Exclude "toan-quoc" (nationwide pseudo-city).
 """
 from __future__ import annotations
-import json, os, time
+import json, os, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +45,14 @@ def load_cached(root):
     return rows
 
 
+def _atomic_io():
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import atomic_io
+    return atomic_io
+
+
 def save_cached(root, cities, source="verify"):
     Path(root).mkdir(parents=True, exist_ok=True)
     p = Path(root) / "_cities.json"
@@ -53,7 +61,7 @@ def save_cached(root, cities, source="verify"):
                "count": len(cities), "cities": cities}
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)
+    _atomic_io().replace_retry(tmp, str(p))
 
 
 def verify_city(session, city, base="https://www.foody.vn", timeout=20):

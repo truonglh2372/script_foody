@@ -23,6 +23,19 @@ A failed send (network, timeout, HTTP error) is logged without the URL and swall
 import json, os, re, shutil, socket, subprocess, sys, threading, time, traceback, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
 
+
+def _replace(src, dst):
+    """os.replace with retries while Windows has the target locked (atomic_io.replace_retry, foody 12/11 12:39:25).
+    Falls back to a plain os.replace when atomic_io.py is not next to this file (the file is shared between repos)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import atomic_io
+    except ImportError:
+        return os.replace(src, dst)
+    return atomic_io.replace_retry(src, dst)
+
 ICT = timezone(timedelta(hours=7))
 CODES = ("google_cutoff", "captcha", "signin_required", "rate_limited", "foody_empty_pages", "http_503", "disk_low",
          "upload_fail", "crash", "stuck")
@@ -282,7 +295,7 @@ class Notifier:
             tmp = f"{self.state_file}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(st, f, ensure_ascii=False)
-            os.replace(tmp, self.state_file)
+            _replace(tmp, self.state_file)
         except OSError:
             pass
 

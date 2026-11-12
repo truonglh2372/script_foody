@@ -16,7 +16,7 @@ Dùng:
 Kết quả: foody_data/<foody_id>/place.json + photos/*.jpg ; tiến độ foody_data/_state.json
 """
 from __future__ import annotations
-import argparse, html, json, os, random, re, sys, time, urllib.parse
+import argparse, html, json, os, random, re, shutil, sys, time, urllib.parse
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -24,6 +24,8 @@ for _s in (sys.stdout, sys.stderr):
         pass
 from datetime import datetime, timezone
 import requests
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import atomic_io  # noqa: E402  os.replace with retry when Windows has the target locked (12/11 12:39:25)
 
 BASE = "https://www.foody.vn"
 CITY = os.environ.get("AQD_FOODY_CITY", "ho-chi-minh")
@@ -664,9 +666,7 @@ def process_item(c, it, a, st, pusher, retry=False):
         rec = fetch_place(c, it, a)
         if rec:
             d = os.path.join(ROOT, fid); os.makedirs(d, exist_ok=True)
-            tmp = os.path.join(d, "place.json.tmp")
-            json.dump(rec, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-            os.replace(tmp, os.path.join(d, "place.json"))
+            atomic_io.write_json_atomic(os.path.join(d, "place.json"), rec, ensure_ascii=False, indent=1)
             k = sum(1 for p in rec["photos"] if p.get("keep"))
             print(f"  ✓ #{fid} {rec['name']} | {len(rec['opening_periods'])} ca | {len(rec['menu'])} món | ảnh {k}/{len(rec['photos'])}"
                   + (" (gallery retry ok)" if retry else ""), flush=True)
@@ -717,11 +717,7 @@ def main(argv=None):
     global HB
     HB = _make_notifier()
     stp = os.path.join(ROOT, "_state.json")
-    try:
-        st = json.load(open(stp, encoding="utf-8")) if os.path.exists(stp) else {"page": 1, "done": {}, "failed": {}}
-    except Exception as e:
-        print(f"[warn] _state.json hỏng ({e}) -> dùng bản .bak nếu có", flush=True)
-        st = json.load(open(stp + ".bak", encoding="utf-8")) if os.path.exists(stp + ".bak") else {"page": 1, "done": {}, "failed": {}}
+    st = _load_state(stp)
     import foody_cities as cities_mod
     st = cities_mod.migrate_state(st, default_slug=CITY)
     # City selection: --cities / AQD_FOODY_CITIES / default all. AQD_FOODY_SINGLE_CITY=1 keeps legacy one-city mode.
@@ -937,6 +933,31 @@ def _build_slices_live(c):
     return out
 
 
+def _load_state(stp):
+    """_state.json, else _state.json.bak (corrupt OR missing - an old build moved _state.json to .bak before the
+    replace, so a failed replace left only the .bak), else a fresh state."""
+    fresh = {"page": 1, "done": {}, "failed": {}}
+    if os.path.exists(stp):
+        try:
+            with open(stp, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] _state.json hỏng ({e}) -> dùng bản .bak nếu có", flush=True)
+    elif os.path.exists(stp + ".bak"):
+        print("[warn] không có _state.json -> dùng bản .bak", flush=True)
+    if os.path.exists(stp + ".bak"):
+        with open(stp + ".bak", encoding="utf-8") as f:
+            return json.load(f)
+    return fresh
+
+
+# A locked _state.json (Windows AV / indexer / a reader) must not kill a long crawl: the full state stays in memory
+# and is written again at the next save. After SAVE_FAIL_MAX failed saves in a row the error is raised (the
+# watchdog restarts foody from the last _state.json on disk, which is never moved away or truncated).
+SAVE_FAIL_MAX = 3
+_SAVE_FAILS = {"n": 0}
+
+
 def _save_state(st, stp):
     # Mirror the active city bucket to top-level keys so older tools/tests that read page/done still work.
     b = _active_bucket(st)
@@ -945,9 +966,22 @@ def _save_state(st, stp):
         if k in b:
             st[k] = b[k]
     if os.path.exists(stp):
-        try: os.replace(stp, stp + ".bak")
+        # copy, not move: _state.json stays in place until the atomic replace below succeeds
+        try: shutil.copyfile(stp, stp + ".bak")
         except OSError: pass
-    tmp = stp + ".tmp"; json.dump(st, open(tmp, "w", encoding="utf-8"), ensure_ascii=False); os.replace(tmp, stp)
+    try:
+        atomic_io.write_json_atomic(stp, st, ensure_ascii=False)
+    except OSError as e:
+        if not atomic_io.is_locked_error(e):
+            raise
+        _SAVE_FAILS["n"] += 1
+        print(f"[warn] không ghi được _state.json ({type(e).__name__}); giữ tiến độ trong bộ nhớ, ghi lại ở lần lưu sau "
+              f"({_SAVE_FAILS['n']}/{SAVE_FAIL_MAX})", flush=True)
+        if _SAVE_FAILS["n"] >= SAVE_FAIL_MAX:
+            raise
+        return False
+    _SAVE_FAILS["n"] = 0
+    return True
 
 
 if __name__ == "__main__":
