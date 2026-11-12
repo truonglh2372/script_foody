@@ -81,6 +81,7 @@ Crawler không có giờ nghỉ cố định, nên job dọn chạy theo lịch:
 - **Không bao giờ** xoá: json/jsonl dữ liệu, dữ liệu chưa đồng bộ, `crawler.env`, `creds.env`, `*.env`, file secret, `chrome-profile`/profile đăng nhập, venv, `.git`, `bak/`; không theo symlink ra ngoài root.
 - Mỗi lần dọn thật: 1 dòng Slack `🧹 *foody @ <máy>* — tự dọn ổ (định kỳ): giải phóng 3,2 GB (1.234 file) · còn trống 11,5 GB`. Log: `foody_data/cleanup.log`.
 - Cài: `sh mac/install_cleanup.sh` (macOS) · `windows\install_cleanup.ps1` (Windows); gỡ: `--uninstall` / `-Uninstall`. Xem trước, không xoá: `--dry-run` / `-DryRun`. Bộ cài 1 lệnh (`install_crawlers`) tự cài job này.
+- Dọn 0 file mà ổ thấp → 1 cảnh báo / `AQD_CLEANUP_ALERT_H` (6) giờ kèm thứ đang chiếm ổ: `docker system df`, thư mục lớn nhất (`common/host_usage.py`, đo bằng `os.scandir`, **chạy được trên Windows**, không cần `du`; giới hạn `AQD_SPACE_SCAN_SECONDS`=90 s, `AQD_SPACE_SCAN_MAX_ENTRIES`=2.000.000 mục/thư mục, đo dở ghi `>=`), `pagefile.sys`/`hiberfil.sys`/`swapfile.sys` và process ngốn RAM nhất (`tasklist` / `ps`). Xem tay: `python common/host_usage.py C:\script_foody`.
 - Test offline: `python3 tests/test_disk_cleanup.py` (có dry-run, vùng cấm, symlink, lịch, khoá, dòng Slack, installer launchd với `launchctl` giả).
 
 ## Gọi thẳng server gốc, bỏ qua Cloudflare (an_uong_quanh_day#1058)
