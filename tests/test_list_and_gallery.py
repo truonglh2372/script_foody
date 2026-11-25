@@ -187,7 +187,7 @@ class ListCap(unittest.TestCase):
             return [], 37208
 
         with mock.patch.object(ff, "ROOT", root), mock.patch.object(ff, "list_page", fake_list), \
-                mock.patch.object(ff, "_build_slices_live", lambda c: [{"district": 5, "cate": "", "total": 2455}]), \
+                mock.patch.object(ff, "_build_slices_live", lambda c, **kw: [{"district": 5, "cate": "", "total": 2455}]), \
                 mock.patch.object(ff, "process_item", lambda *a, **k: "none"), \
                 mock.patch.object(ff.time, "sleep", lambda s: None), mock.patch.object(ff, "_make_notifier", lambda: None):
             ff.main(["--limit", "0", "--no-push"])

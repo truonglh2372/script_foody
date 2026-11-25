@@ -88,6 +88,19 @@ LIST_TIMEOUT_SKIP = _int_env("AQD_FOODY_LIST_TIMEOUT_SKIP", 6)
 TIMEOUT_BACKOFF = _backoff_env("AQD_FOODY_TIMEOUT_BACKOFF", "60,120,300,600")  # 1, 2, 5, 10 min, then 10 min
 
 
+def _float_env(name, default, lo=0.0):
+    try:
+        return max(lo, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return float(default)
+
+
+SLICE_PROBE_RETRIES = _int_env("AQD_FOODY_SLICE_PROBE_RETRIES", 3)
+SLICE_PROBE_BACKOFF = _float_env("AQD_FOODY_SLICE_PROBE_BACKOFF", 30)
+SLICE_PROBE_BACKOFF_MAX = _float_env("AQD_FOODY_SLICE_PROBE_BACKOFF_MAX", 600)
+SLICE_RETRY_PAUSE = _float_env("AQD_FOODY_SLICE_RETRY_PAUSE", 1800)
+
+
 def timeout_wait(n):
     """Seconds to wait after the n-th (1-based) consecutive ConnectTimeout."""
     return TIMEOUT_BACKOFF[min(n, len(TIMEOUT_BACKOFF)) - 1]
@@ -99,6 +112,26 @@ class ConnectTimeoutGiveUp(RuntimeError):
     def __init__(self, url, count):
         super().__init__(f"bỏ cuộc sau {count} lần ConnectTimeout liên tiếp: {url}")
         self.url, self.count = url, count
+
+
+class CityMismatchError(RuntimeError):
+    """HomeListPlace answered for another province than the one the client asked for (Foody ignored floc)."""
+
+    def __init__(self, city, expected, got):
+        super().__init__(f"{city}: HomeListPlace trả CityId={got}, không phải {expected}")
+        self.city, self.expected, self.got = city, expected, got
+
+
+class SliceProbeError(RuntimeError):
+    """A slice probe still failed after SLICE_PROBE_RETRIES attempts."""
+
+
+class SliceBuildError(RuntimeError):
+    """No slice could be built for a city that needs them; the city must not be marked finished."""
+
+    def __init__(self, city, known_total, probe_errors):
+        super().__init__(f"{city}: 0 lát (tổng đã biết {known_total}, {probe_errors} probe lỗi)")
+        self.city, self.known_total, self.probe_errors = city, known_total, probe_errors
 
 
 GALLERY_TRIES = int(os.environ.get("AQD_FOODY_GALLERY_TRIES", "5"))
@@ -221,6 +254,16 @@ def list_page(c, page, count=12, district="", cate=""):
     q = (f"/__get/Place/HomeListPlace?t={int(time.time()*1000)}&page={page}&lat={lat}&lon={lon}"
          f"&count={count}&districtId={district}&cateId={cate}&cuisineId=&isReputation=&type=1")
     d = c.json(q, referer=f"/{city}/o-dau") or {}
+    if not isinstance(d, dict):
+        d = {}
+    got, want = d.get("CityId"), getattr(c, "city_id", None)
+    if got not in (None, "") and want is not None:
+        try:
+            mismatch = int(got) != int(want)
+        except (TypeError, ValueError):
+            mismatch = False
+        if mismatch:
+            raise CityMismatchError(city, int(want), got)
     return d.get("Items") or [], d.get("Total")
 
 
@@ -543,19 +586,50 @@ def plan_empty_page(st, page, total, page_size=PAGE_SIZE, retries=None, backoff=
     return "skip", page + 1, 0
 
 
-def fetch_district_ids(c):
+def probe_retry(fn, what, retries=None, backoff=None, backoff_max=None):
+    """fn() until it returns a non-None value; exceptions and None are retried with exponential backoff.
+    CityMismatchError is never retried. Raises SliceProbeError after `retries` failed attempts."""
+    retries = SLICE_PROBE_RETRIES if retries is None else max(1, int(retries))
+    backoff = SLICE_PROBE_BACKOFF if backoff is None else backoff
+    backoff_max = SLICE_PROBE_BACKOFF_MAX if backoff_max is None else backoff_max
+    last = None
+    for i in range(retries):
+        try:
+            v = fn()
+        except CityMismatchError:
+            raise
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+        else:
+            if v is not None:
+                return v
+            last = "không có dữ liệu"
+        if i + 1 < retries:
+            w = min(backoff * (2 ** i), backoff_max)
+            print(f"  ! probe {what} lỗi ({last}) -> thử lại sau {int(w)}s (lần {i + 1}/{retries})", flush=True)
+            time.sleep(w)
+    raise SliceProbeError(f"probe {what} lỗi sau {retries} lần: {last}")
+
+
+def fetch_district_ids(c, stats=None, retries=None, backoff=None):
     """Foody district ids for the client's current province via GetDistrictsByProvinceId.
     These ids are global (HCM≈1..19, Hà Nội≈20..29+690+, Bắc Kạn≈198+), NOT 1..N per city.
-    Returns a list of int ids, or [] on failure (caller may fall back to probing)."""
+    Failed requests are retried with backoff; returns a list of int ids, or [] when they keep failing
+    (stats["errors"] is incremented, caller may fall back to probing)."""
     cid = int(getattr(c, "city_id", CITY_ID) or CITY_ID)
-    path = f"/__get/Common/GetDistrictsByProvinceId?provinceId={cid}&t={int(time.time() * 1000)}"
-    try:
+
+    def once():
+        path = f"/__get/Common/GetDistrictsByProvinceId?provinceId={cid}&t={int(time.time() * 1000)}"
         data = c.json(path, referer=f"/{getattr(c, 'city', CITY)}/o-dau")
-    except Exception as e:
-        print(f"  ! GetDistrictsByProvinceId provinceId={cid}: {type(e).__name__}: {e}", flush=True)
-        return []
-    rows = (data or {}).get("data") if isinstance(data, dict) else data
-    if not isinstance(rows, list):
+        rows = data.get("data") if isinstance(data, dict) else data
+        return rows if isinstance(rows, list) else None
+
+    try:
+        rows = probe_retry(once, f"GetDistrictsByProvinceId provinceId={cid}", retries=retries, backoff=backoff)
+    except SliceProbeError as e:
+        print(f"  ! {e}", flush=True)
+        if stats is not None:
+            stats["errors"] = int(stats.get("errors") or 0) + 1
         return []
     out = []
     for row in rows:
@@ -573,17 +647,23 @@ def fetch_district_ids(c):
     return uniq
 
 
-def build_slices(total_of, cap=None, max_id=None, district_ids=None):
+def build_slices(total_of, cap=None, max_id=None, district_ids=None, cate_fallback=True):
     """Slices of the city list that each fit under the API cap. total_of(district, cate) -> Total (int or None).
     Districts under the cap are one slice; a district over it is split by every cateId seen city-wide.
-    Prefer `district_ids` from GetDistrictsByProvinceId; otherwise probe 1..max_id (HCM-only legacy)."""
+    Prefer `district_ids` from GetDistrictsByProvinceId; otherwise probe 1..max_id (HCM-only legacy).
+    cate_fallback: when no district yields a slice, slice the city by category only (district="", cate=k)."""
     cap = LIST_CAP if cap is None else cap
     max_id = SLICE_MAX_ID if max_id is None else max_id
     if district_ids:
         districts = [int(d) for d in district_ids if int(d) > 0]
     else:
         districts = list(range(1, max_id + 1))
-    cates = [k for k in range(1, max_id + 1) if (total_of("", k) or 0) > 0]
+    cate_totals = {}
+    for k in range(1, max_id + 1):
+        t = total_of("", k) or 0
+        if t > 0:
+            cate_totals[k] = t
+    cates = list(cate_totals)
     out = []
     for d in districts:
         t = total_of(d, "") or 0
@@ -596,6 +676,8 @@ def build_slices(total_of, cap=None, max_id=None, district_ids=None):
             tk = total_of(d, k) or 0
             if tk > 0:
                 out.append({"district": d, "cate": k, "total": tk})
+    if not out and cate_fallback:
+        out = [{"district": "", "cate": k, "total": t} for k, t in cate_totals.items()]
     return out
 
 
@@ -791,8 +873,9 @@ def _where(page, parity, st, bucket=None):
     bucket = bucket if bucket is not None else _active_bucket(st)
     total = bucket.get("total")
     kw = slice_kw(bucket)
-    sl = (f" [lát {bucket.get('slice')}/{len(bucket.get('slices') or [])}: quận {kw['district']}"
-          + (f", loại {kw['cate']}" if kw["cate"] != "" else "") + "]") if kw else ""
+    parts = ([f"quận {kw['district']}"] if kw and kw["district"] != "" else []) + \
+            ([f"loại {kw['cate']}"] if kw and kw["cate"] != "" else [])
+    sl = f" [lát {bucket.get('slice')}/{len(bucket.get('slices') or [])}: {', '.join(parts)}]" if kw else ""
     city = st.get("city") or CITY
     return (f"foody page {page}{sl}, city {city}, parity {parity}"
             + (f" (tổng list {int(total):,})".replace(",", ".") if total else ""))
@@ -842,26 +925,44 @@ def _crawl(a, st, stp, pusher, c, page):
             st_city_sync_page(st, b, page)
             _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
             continue
+        except CityMismatchError as e:
+            b, page, wait = _skip_mismatched_city(st, b, c, by_slug, cities_mod, e)
+            _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
+            time.sleep(wait)
+            continue
         print(f"[{st.get('city')}] trang {page}{' ' + str(kw) if kw else ''}: {len(items)} quán (tổng {total})", flush=True)
         if not items:
             action, nxt, wait = plan_empty_page(b, page, total)
-            if action == "end" and next_slice(b, lambda: _build_slices_live(c)):
+            more = False
+            if action == "end":
+                try:
+                    more = next_slice(b, lambda: _build_slices_live(c, known_total=b.get("total")))
+                except CityMismatchError as e:
+                    b, page, wait = _skip_mismatched_city(st, b, c, by_slug, cities_mod, e)
+                    _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
+                    time.sleep(wait)
+                    continue
+                except SliceBuildError as e:
+                    msg = (f"{e} -> GIỮ {st.get('city')} trang {page} (chưa xong), dựng lát lại sau "
+                           f"{int(SLICE_RETRY_PAUSE // 60)} phút")
+                    print("  ! " + msg, flush=True)
+                    b["slice_build_error"] = {"page": page, "known_total": e.known_total,
+                                              "probe_errors": e.probe_errors, "at": now()}
+                    b["page"] = page
+                    _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
+                    hb("error", "foody_slice_build", msg, action="kiểm tra foody.vn / mạng trên máy này; city chưa "
+                       "bị đánh dấu xong, sẽ tự thử lại", severe=True)
+                    time.sleep(SLICE_RETRY_PAUSE)
+                    continue
+                b.pop("slice_build_error", None)
+            if more:
                 kw = slice_kw(b)
                 print(f"hết lát hiện tại (API chỉ trả tối đa {LIST_CAP} quán/lượt) -> sang lát {b['slice']}/"
                       f"{len(b['slices'])} {kw}", flush=True)
                 wait = 0
             elif action == "end":
-                # City sweep finished -> next city (preserve prior city progress in its own bucket).
-                order = st.get("city_order") or [st.get("city") or CITY]
-                skip = set(st.get("skip_cities") or [])
-                slug, wrapped = cities_mod.advance_city(st, order)
-                if slug in skip:
-                    slug, wrapped2 = cities_mod.skip_current_cities(st, order, skip)
-                    wrapped = wrapped or wrapped2
-                if slug and slug in by_slug:
-                    c.set_city(by_slug[slug])
-                b = _active_bucket(st)
-                page = 1; b["page"] = 1; b.pop("slices", None); b["slice"] = 0; b.pop("total", None)
+                slug, wrapped, b = _next_city(st, c, by_slug, cities_mod)
+                page = 1
                 msg = (f"hết tỉnh/thành, nghỉ {int(END_PAUSE // 60)} phút rồi quét lại từ {slug}"
                        if wrapped else f"xong city trước -> sang {slug}")
                 print(msg, flush=True)
@@ -877,7 +978,7 @@ def _crawl(a, st, stp, pusher, c, page):
             page = nxt; b["page"] = page; _save_state(st, stp); hb("position", _where(page, a.parity, st, b))
             if wait: time.sleep(wait)
             continue
-        note_page_ok(b, total); hb("page_ok")
+        note_page_ok(b, total); hb("page_ok"); b.pop("city_mismatch", None)
         for it in items:
             if a.limit and n >= a.limit:
                 break
@@ -900,6 +1001,40 @@ def st_city_sync_page(st, b, page):
     b["page"] = page
 
 
+def _reset_bucket_sweep(b):
+    b["page"] = 1; b.pop("slices", None); b["slice"] = 0; b.pop("total", None)
+
+
+def _next_city(st, c, by_slug, cities_mod):
+    """Move to the next city (prior city progress stays in its own bucket). Returns (slug, wrapped, bucket)."""
+    order = st.get("city_order") or [st.get("city") or CITY]
+    skip = set(st.get("skip_cities") or [])
+    slug, wrapped = cities_mod.advance_city(st, order)
+    if slug in skip:
+        slug, wrapped2 = cities_mod.skip_current_cities(st, order, skip)
+        wrapped = wrapped or wrapped2
+    if slug and slug in by_slug:
+        c.set_city(by_slug[slug])
+    b = _active_bucket(st)
+    _reset_bucket_sweep(b)
+    return slug, wrapped, b
+
+
+def _skip_mismatched_city(st, b, c, by_slug, cities_mod, exc):
+    """Foody served another province for this city: log + alert, never crawl those items, go to the next city.
+    Returns (bucket, page, wait)."""
+    msg = f"{exc} -> Foody không nhận floc của city này, bỏ qua (không cào quán của tỉnh khác)"
+    print("  ! " + msg, flush=True)
+    b["city_mismatch"] = {"expected": exc.expected, "got": exc.got, "at": now()}
+    _reset_bucket_sweep(b)
+    hb("error", "foody_city_mismatch", msg, action="city bị bỏ qua trong lượt này; xem lại slug/id trong "
+       "data/foody_cities.json", severe=True)
+    slug, wrapped, nb = _next_city(st, c, by_slug, cities_mod)
+    print(f"bỏ {exc.city} -> sang {slug}" + (f", hết tỉnh/thành, nghỉ {int(END_PAUSE // 60)} phút" if wrapped else ""),
+          flush=True)
+    return nb, 1, END_PAUSE if wrapped else 2
+
+
 def skip_timeout_page(st, page, exc):
     """A list page that only ever times out: log it, tell Slack, move on to the next page (never crash)."""
     nxt = page + 1
@@ -913,23 +1048,37 @@ def skip_timeout_page(st, page, exc):
     return nxt
 
 
-def _build_slices_live(c):
+def _build_slices_live(c, known_total=None):
+    """Live slice list for the client's city. CityMismatchError propagates (wrong province, nothing to slice).
+    Raises SliceBuildError when 0 slices come out although probes failed or the known total is over LIST_CAP."""
+    stats = {"errors": 0}
+
     def total_of(d, k):
         try:
-            return list_page(c, 1, district=d, cate=k)[1]
-        except Exception:
+            return probe_retry(lambda: list_page(c, 1, district=d, cate=k)[1], f"Total quận={d!r} loại={k!r}")
+        except SliceProbeError as e:
+            print(f"  ! {e}", flush=True)
+            stats["errors"] += 1
             return None
-    districts = fetch_district_ids(c)
+
+    districts = fetch_district_ids(c, stats=stats)
     if districts:
         print(f"dựng danh sách lát từ {len(districts)} quận/huyện Foody "
               f"(provinceId={getattr(c, 'city_id', '?')}, mỗi lát <= {LIST_CAP} quán)...", flush=True)
-        out = build_slices(total_of, district_ids=districts)
+        out = build_slices(total_of, district_ids=districts, cate_fallback=True)
     else:
         print(f"dựng danh sách lát (fallback probe 1..{SLICE_MAX_ID}, mỗi lát <= {LIST_CAP} quán)...", flush=True)
-        out = build_slices(total_of)
-    print(f"  {len(out)} lát, tổng {sum(x['total'] for x in out)} quán", flush=True)
+        out = build_slices(total_of, cate_fallback=True)
+    print(f"  {len(out)} lát, tổng {sum(x['total'] for x in out)} quán"
+          + (f", {stats['errors']} probe lỗi" if stats["errors"] else ""), flush=True)
     if not out:
-        print("  ! 0 lát — city này sẽ được bỏ qua (không có district/cate trả Total>0)", flush=True)
+        try:
+            known = int(known_total or 0)
+        except (TypeError, ValueError):
+            known = 0
+        if stats["errors"] > 0 or known > LIST_CAP:
+            raise SliceBuildError(getattr(c, "city", CITY), known_total, stats["errors"])
+        print("  0 lát — tổng đã biết nằm trong giới hạn API, city coi như đã quét hết", flush=True)
     return out
 
 

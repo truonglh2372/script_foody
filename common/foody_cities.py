@@ -11,7 +11,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SEED = HERE.parent / "data" / "foody_cities.json"
-SKIP_SLUGS = frozenset({"toan-quoc"})
+# "da-lat" (281) is a broken alias: /da-lat/o-dau never sets floc=281, so HomeListPlace falls back to HCM (CityId 217,
+# ~37k places) and its districts 1220/1221 return Total 0. Real Đà Lạt places live under lam-dong (254, district 246).
+SKIP_SLUGS = frozenset({"toan-quoc", "da-lat"})
 
 
 def seed_cities():
@@ -42,7 +44,8 @@ def load_cached(root):
     rows = d.get("cities") if isinstance(d, dict) else d
     if not isinstance(rows, list) or not rows:
         return None
-    return rows
+    rows = [r for r in rows if not (isinstance(r, dict) and str(r.get("slug") or "").strip() in SKIP_SLUGS)]
+    return rows or None
 
 
 def _atomic_io():
