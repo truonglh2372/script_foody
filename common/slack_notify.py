@@ -6,7 +6,10 @@ Each crawler posts straight to ONE shared Slack channel through an Incoming Webh
   - a report every AQD_REPORT_EVERY_H hours (default 4) from a timer thread in the long-running process,
   - a message when it starts and when it stops normally,
   - an immediate alert on a severe error (captcha, sign-in needed, disk < AQD_DISK_MIN_GB, crash,
-    AQD_EMPTY_PAGES_ALERT empty list pages in a row) and when nothing new came in for AQD_STUCK_HOURS (default 3),
+    AQD_EMPTY_PAGES_ALERT empty list pages in a row) and when neither a new item nor a successful list page
+    (page_ok) came in for AQD_STUCK_HOURS (default 3),
+  - one low-priority notice when list pages keep advancing but nothing new came in for AQD_IDLE_NOTICE_HOURS
+    (default 24); sent again only after new items have appeared,
   - at most one alert per crawler / host / error code every AQD_ALERT_EVERY_H hours (default 4), kept in
     <state dir>/slack_state.json so it holds across restarts and across short-lived processes.
 
@@ -267,6 +270,7 @@ class Notifier:
         self.every = _float_env(self.env, "AQD_REPORT_EVERY_H", 4) * 3600
         self.alert_every = _float_env(self.env, "AQD_ALERT_EVERY_H", 4) * 3600
         self.stuck_after = _float_env(self.env, "AQD_STUCK_HOURS", 3) * 3600
+        self.idle_after = _float_env(self.env, "AQD_IDLE_NOTICE_HOURS", 24) * 3600
         self.empty_alert = int(_float_env(self.env, "AQD_EMPTY_PAGES_ALERT", 10))
         self.disk_min = _float_env(self.env, "AQD_DISK_MIN_GB", 5)
         self.labels = {"places": "quán", "photos": "ảnh", "reviews": "review"}
@@ -366,8 +370,9 @@ class Notifier:
                 for k, v in delta.items():
                     counts[k] = int(counts.get(k, 0)) + v
             if any(k in PROGRESS for k in delta):
-                st["last_progress"] = st["last_success"] = self.now()
+                st["last_progress"] = st["last_success"] = st["last_new_item"] = self.now()
                 st.pop("stuck_since", None)
+                st.pop("idle_notice", None)
             elif delta.get("upload_ok"):
                 st["last_success"] = self.now()
         self._update(fn)
@@ -409,7 +414,16 @@ class Notifier:
             self.error("foody_empty_pages", f"{streak} trang list liên tiếp trả \"0 quán\"{span}")
 
     def page_ok(self):
-        self._update(lambda st: (st.pop("empty_streak", None), st.pop("empty_first", None)))
+        def fn(st):
+            st.pop("empty_streak", None)
+            st.pop("empty_first", None)
+            st.pop("stuck_since", None)
+            st["last_page_ok"] = self.now()
+        self._update(fn)
+
+    @staticmethod
+    def alive_since(st):
+        return max(float(st.get("last_progress") or 0), float(st.get("last_page_ok") or 0)) or None
 
     def error(self, code, detail="", action=None, severe=None):
         """Remember the last error; severe ones (or severe=True) alert right away, deduped per code."""
@@ -429,8 +443,10 @@ class Notifier:
             body = [f"• Lỗi: `{code}` — {detail}" if detail else f"• Lỗi: `{code}`"]
             pos = st.get("position")
             last = st.get("last_success")
+            page = st.get("last_page_ok")
             body.append("• Vị trí: " + (pos or "không rõ")
-                        + (f" · thành công cuối {hhmm(last)} (UTC+7)" if last else ""))
+                        + (f" · thành công cuối {hhmm(last)} (UTC+7)" if last else "")
+                        + (f" · trang list cuối {hhmm(page)} (UTC+7)" if page else ""))
         body.append(f"• Việc cần làm: *{act}*" if act else "• Việc cần làm: không")
         title = f"`{code}`" if code in ("foody_empty_pages",) else TITLES.get(code, f"`{code}`")
         text = (f"🔴 {mention(self.env)}{self._title()} — LỖI: {title}\n" + "\n".join(body)
@@ -471,6 +487,7 @@ class Notifier:
             st["run"] = {"start": self.now(), "pid": os.getpid(), "counts": {}}
             st.setdefault("win", {"start": self.now(), "counts": {}})
             st["last_progress"] = max(float(st.get("last_progress") or 0), self.now())
+            st.setdefault("last_new_item", self.now())
             st["next_report"] = self.now() + self.every
             st["alive_at"] = self.now()
             st.pop("stopped", None)
@@ -506,10 +523,11 @@ class Notifier:
 
     def status(self, st):
         err = st.get("last_error") or {}
-        if err.get("severe") and float(err.get("at") or 0) > float(st.get("last_progress") or 0) \
+        alive = self.alive_since(st)
+        if err.get("severe") and float(err.get("at") or 0) > (alive or 0) \
                 and self.now() - float(err.get("at") or 0) < self.every:
             return "🔴", "lỗi"
-        if self.now() - float(st.get("last_progress") or self.now()) >= self.stuck_after:
+        if self.now() - (alive or self.now()) >= self.stuck_after:
             return "🟡", "kẹt"
         return "🟢", "đang chạy"
 
@@ -527,6 +545,7 @@ class Notifier:
         emoji, word = self.status(st)
         err = st.get("last_error") or {}
         last = st.get("last_success")
+        page = st.get("last_page_ok")
         if err:
             err_line = f"`{err['code']}` {hhmm(err['at'])}" + (f" — {err['detail']}" if err.get("detail") else "")
         else:
@@ -539,7 +558,8 @@ class Notifier:
                 f"• Vị trí: {st.get('position') or 'không rõ'}\n"
                 f"• {int(round((self.now() - start) / 3600)) or 1} giờ qua ({hhmm(start)}–{hhmm(self.now())}): "
                 f"{self._counts_text(win.get('counts'))}\n"
-                f"• Thành công cuối: {ddmm_hhmm(last) + ' (UTC+7)' if last else 'chưa có'}\n"
+                f"• Thành công cuối: item mới {ddmm_hhmm(last) + ' (UTC+7)' if last else 'chưa có'} · trang list "
+                f"{ddmm_hhmm(page) + ' (UTC+7)' if page else 'chưa có'}\n"
                 f"• Lỗi gần nhất: {err_line}\n"
                 + (f"• Việc cần làm: *{act}*\n" if act else "• Việc cần làm: không\n")
                 + f"_Báo cáo lúc {ddmm_hhmm(self.now())} (UTC+7) · tin kế tiếp ~{hhmm(self.now() + self.every)}_")
@@ -547,7 +567,7 @@ class Notifier:
 
     def check_stuck(self):
         def fn(st):
-            since = float(st.get("last_progress") or self.now())
+            since = self.alive_since(st) or self.now()
             if self.now() - since < self.stuck_after:
                 return None
             if not self._allow(st, "stuck"):
@@ -557,7 +577,8 @@ class Notifier:
         st = self._update(fn)
         if not st:
             return False
-        since = float(st["last_progress"])
+        since = float(st["stuck_since"])
+        page = st.get("last_page_ok")
         run = st.get("run") or {}
         err = st.get("last_error") or {}
         hours = self.stuck_after / 3600
@@ -565,13 +586,37 @@ class Notifier:
         pid_txt = f"PID {run.get('pid')}" + (f", từ {ddmm(run['start'])}" if run.get("start") else "") if run else ""
         text = (f"🟡 {self._title()} — KẸT: {hours_txt} giờ không có {self.labels['places']}/"
                 f"{self.labels['reviews']} mới\n"
-                f"• Process vẫn chạy ({pid_txt}) nhưng 0 item mới từ {hhmm(since)} (UTC+7)\n"
+                f"• Process vẫn chạy ({pid_txt}) nhưng 0 item mới từ {hhmm(since)} (UTC+7), trang list cuối "
+                f"{ddmm_hhmm(page) + ' (UTC+7)' if page else 'chưa có'}\n"
                 f"• Đang làm: {st.get('position') or 'không rõ'}\n"
                 + (f"• Lỗi gần nhất: `{err['code']}` {hhmm(err['at'])}\n" if err else "• Lỗi gần nhất: không\n")
                 + f"• Việc cần làm: *{self._action('stuck')}*\n"
                 f"_{ddmm_hhmm(self.now())} (UTC+7) · ngưỡng {hours_txt}h (AQD_STUCK_HOURS) · nhắc lại sớm nhất "
                 f"{hhmm(self.now() + self.alert_every)}_")
         return self._send("stuck", text)
+
+    def check_idle(self):
+        def fn(st):
+            page = float(st.get("last_page_ok") or 0)
+            last_new = float(st.get("last_new_item") or st.get("last_progress") or 0)
+            if st.get("idle_notice") or not page or not last_new:
+                return None
+            if self.now() - page >= self.stuck_after or self.now() - last_new < self.idle_after:
+                return None
+            st["idle_notice"] = self.now()
+            return dict(st)
+        st = self._update(fn)
+        if not st:
+            return False
+        last_new = float(st.get("last_new_item") or st.get("last_progress"))
+        text = (f"🔵 {self._title()} — quét xong, không có {self.labels['places']} mới\n"
+                f"• Trang list vẫn chạy (cuối {hhmm(st['last_page_ok'])} UTC+7) nhưng 0 item mới từ "
+                f"{ddmm_hhmm(last_new)} (UTC+7, {duration(self.now() - last_new)})\n"
+                f"• Đang làm: {st.get('position') or 'không rõ'}\n"
+                f"• Việc cần làm: không\n"
+                f"_{ddmm_hhmm(self.now())} (UTC+7) · ngưỡng {self.idle_after / 3600:g}h (AQD_IDLE_NOTICE_HOURS) · "
+                f"chỉ báo lại sau khi có item mới_")
+        return self._send("idle", text)
 
     def check_disk(self):
         free = self.disk_free_gb()
@@ -586,6 +631,7 @@ class Notifier:
             st = self._update(lambda s: (s.__setitem__("alive_at", self.now()), dict(s))[1])
             self.check_disk()
             self.check_stuck()
+            self.check_idle()
             if self.now() >= float(st.get("next_report") or 0):
                 self.report()
         except Exception as e:  # noqa: BLE001
