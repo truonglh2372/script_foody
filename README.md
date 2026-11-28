@@ -93,15 +93,25 @@ Crawler không có giờ nghỉ cố định, nên job dọn chạy theo lịch:
 Đường Viettel → Cloudflare SG hay mất gói nên gọi API qua Cloudflare chậm. Thêm **một dòng** vào `creds.env` (hoặc biến môi trường) để gọi thẳng server gốc:
 
 ```
-AQD_ORIGIN_IP=<IP server gốc, chủ dự án đưa>
+AQD_ORIGIN_IP=origin.anuongquanhday.com
 ```
+
+`AQD_ORIGIN_IP` nhận **tên host** (bản ghi DNS-only, ví dụ `origin.anuongquanhday.com`) hoặc một địa chỉ IP. Dùng tên host thì khi chuyển server chỉ cần đổi bản ghi DNS, không phải sửa từng máy. Tên host được tra bằng resolver thật của hệ điều hành (không đi qua chính cái pin này), lưu cache và tra lại mỗi 5 phút; tra lỗi thì giữ IP tốt gần nhất và ghi cảnh báo. Dòng IP cũ (`AQD_ORIGIN_IP=203.0.113.10`) và dòng trống chạy y như trước.
 
 - Giống `curl --resolve`: chỉ việc tra DNS của host trong `AQD_BASE` được thay bằng IP đó. URL, SNI, header `Host` và việc kiểm tra chứng chỉ vẫn dùng tên `anuongquanhday.com`, nên chứng chỉ phải khớp tên (server gốc có sẵn chứng chỉ Let's Encrypt cho tên này). **Không bao giờ tắt kiểm tra TLS**; token / đăng nhập admin không đổi.
 - Chỉ pin đúng host của `AQD_BASE`; Google, Foody, CDN ảnh... vẫn tra DNS bình thường.
-- `AQD_BASE` phải là `https://...` và `AQD_ORIGIN_IP` phải là đúng một địa chỉ IP, không thì client admin báo lỗi ngay (`OriginPinError`). Để trống / không có dòng này = như cũ (qua Cloudflare).
+- `AQD_BASE` phải là `https://...` và `AQD_ORIGIN_IP` phải là một địa chỉ IP hoặc một tên host hợp lệ, không thì client admin báo lỗi ngay (`OriginPinError`). Để trống / không có dòng này = như cũ (qua Cloudflare).
 - **Bỏ:** xoá dòng đó rồi khởi động lại crawler. Chạy lại installer và chọn ghi đè `creds.env` sẽ mất dòng này (khi đó crawler lại đi qua Cloudflare, vẫn chạy được); thêm lại sau khi cài.
 - Kiểm tra trên máy: `curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --resolve anuongquanhday.com:443:<IP> https://anuongquanhday.com/up` phải ra `200`.
-- Test offline: `python3 tests/test_origin_pin.py` (server TLS thật ở 127.0.0.1 với CA tạm; phần `requests` cần `pip install -r requirements.txt`).
+- Test offline: `python3 tests/test_origin_host.py` (tên host, cache, tra lại, tra lỗi) và `python3 tests/test_origin_pin.py` (server TLS thật ở 127.0.0.1 với CA tạm; phần `requests` cần `pip install -r requirements.txt`).
+
+## Server tạm dừng ghi (`ingest_paused`) và heartbeat (script_foody#32)
+Khi chủ dự án bật công tắc `ingest_paused` trên server (bảo trì, chuyển server), mọi ghi `POST/PUT/PATCH/DELETE` tới `/v1/admin/*` và `/v1/ingest/*` trả `503` + `Retry-After` + `{"error":"ingest_paused","retry_after":300}` (đăng nhập `/v1/auth/*` và heartbeat vẫn chạy, `GET` không bị chặn).
+- Crawler **ngủ `Retry-After` giây** (mặc định 300, tối đa 900) rồi **gửi lại đúng request đó**: quán / ảnh không bị đánh lỗi, không bị đếm lỗi, không bị bỏ. Áp dụng cho mọi đường ghi, kể cả POST ảnh. Vào / ra tạm dừng chỉ ghi log **một lần**. 503 khác vẫn xử lý như cũ.
+- Heartbeat (`common/heartbeat.py`, luồng nền, **tối thiểu 5 phút một lần**, và gửi ngay khi trạng thái tạm dừng đổi) gửi `crawler`, `host` (tên máy), `status`, số đếm và phiên bản crawler trong `note` tới `/v1/ingest/heartbeats`. Trả lời có `"paused": true` thì crawler vào tạm dừng, `false` thì ra. Lỗi heartbeat không bao giờ dừng việc cào.
+- Bật heartbeat: thêm vào `creds.env` dòng `AQD_INGEST_TOKEN=<token của máy này, Admin -> Ingest clients>` (không có thì heartbeat tắt); `AQD_HEARTBEAT=0` để tắt; `CRAWLER_HOSTNAME` ghi đè tên máy.
+- File `STOP` / `STOP_ALL` trên máy vẫn dùng được như phương án dự phòng (máy chạy bản cũ).
+- Test offline: `python3 tests/test_ingest_pause.py`, `python3 tests/test_heartbeat.py`.
 
 ## Lấy những gì
 Nguồn: danh sách `https://www.foody.vn/ho-chi-minh/o-dau` (JSON công khai trang này dùng), không đăng nhập, không vượt captcha.
