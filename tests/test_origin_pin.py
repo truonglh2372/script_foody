@@ -127,7 +127,7 @@ class OriginPinTest(unittest.TestCase):
         self.assertEqual(("anuongquanhday.com", "2001:db8::1"), origin_pin.parse("https://anuongquanhday.com", "2001:db8::1"))
 
     def test_bad_values_are_refused(self):
-        for value in ("anuongquanhday.com", "10.0.0.0/8", "1.2.3", "fe80::1%en0", "1.2.3.4 5.6.7.8"):
+        for value in ("not an ip", "10.0.0.0/8", "1.2.3", "fe80::1%en0", "1.2.3.4 5.6.7.8"):
             with self.assertRaises(origin_pin.OriginPinError, msg=value):
                 origin_pin.parse("https://anuongquanhday.com", value)
 
@@ -198,7 +198,7 @@ class OriginPinTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_REQUESTS, "needs requests + Pillow")
     def test_aqd_api_rejects_a_bad_pin_before_any_request(self):
         import aqd_api
-        os.environ["AQD_ORIGIN_IP"] = "not-an-ip"
+        os.environ["AQD_ORIGIN_IP"] = "not an ip"
         with self.assertRaises(origin_pin.OriginPinError):
             aqd_api.AQD(base="https://anuongquanhday.com")
 

@@ -151,6 +151,27 @@ def _make_notifier():
         return None
 
 
+def _make_server_heartbeat(pusher, start=True):
+    """Server heartbeat (script_foody#32): every <=5 min with host name + version; its `paused` answer pauses writes.
+    Token AQD_INGEST_TOKEN from env / creds.env; none -> disabled. Never stops the crawl."""
+    import heartbeat
+    try:
+        from foody_push import load_creds
+        load_creds()
+    except Exception:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        import slack_notify
+        version = slack_notify.git_version(here)
+    except Exception:
+        version = None
+    stats = (lambda: {"processed": pusher.stats["pushed"], "photos": pusher.stats["photos"],
+                      "errors": pusher.stats["fail"]}) if pusher else None
+    h = heartbeat.Heartbeat("script_foody", version=version, counters=stats, disk_dir=ROOT)
+    return h.start() if start else h
+
+
 HB = None
 
 
@@ -861,6 +882,10 @@ def main(argv=None):
                                     "upload_fail": pusher.stats["fail"]})
     hb("install_crash_hook")
     hb("start_timer")
+    try:
+        _make_server_heartbeat(pusher)
+    except Exception:
+        pass
     try:
         n = _crawl(a, st, stp, pusher, c, page)
     except KeyboardInterrupt:

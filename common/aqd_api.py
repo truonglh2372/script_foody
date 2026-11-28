@@ -34,6 +34,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import origin_pin  # noqa: E402  AQD_ORIGIN_IP: call the origin directly, bypassing Cloudflare
 import atomic_io  # noqa: E402  os.replace with retry when Windows has the target locked
+import ingest_pause  # noqa: E402  server-driven pause: 503 ingest_paused -> sleep Retry-After, retry the same request
 
 ROOT = os.environ.get("AQD_ROOT", "C:/aqd").replace("\\", "/")
 BASE = os.environ.get("AQD_BASE", "https://anuongquanhday.com")
@@ -296,7 +297,11 @@ class AQD:
         forced = False
         if THROTTLE:
             retries = 0
-        for attempt in range(retries + 1):
+        attempt = -1
+        while attempt < retries:
+            attempt += 1
+            if method.upper() != "GET":
+                ingest_pause.STATE.wait()   # a pause learned from a heartbeat also holds writes back
             if THROTTLE:
                 with _THR_LOCK:
                     w = _THR[0] + THROTTLE - time.time()
@@ -320,6 +325,18 @@ class AQD:
                 forced = True
                 self.tokens.access(force=True)
                 continue
+            if r.status_code == 503:
+                try:
+                    pbody = r.json()
+                except ValueError:
+                    pbody = None
+                if ingest_pause.is_pause_response(503, pbody):   # the SAME request is retried; no attempt is used up
+                    ingest_pause.STATE.enter(r.headers.get("Retry-After") or (pbody or {}).get("retry_after"))
+                    ingest_pause.STATE.wait()
+                    attempt -= 1
+                    continue
+            if ingest_pause.STATE.active:   # any answer that is not a pause ends it (logged once)
+                ingest_pause.STATE.leave()
             if r.status_code in retry_status and attempt < retries:
                 ra = r.headers.get("Retry-After")
                 time.sleep(float(ra) if ra and ra.isdigit() else min(2 ** attempt, 20)); continue
