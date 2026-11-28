@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
 os.environ.pop("AQD_ORIGIN_IP", None)
 import heartbeat  # noqa: E402
 import ingest_pause  # noqa: E402
+import origin_pin  # noqa: E402
 
 
 class FakeResponse:
@@ -49,6 +50,7 @@ class HeartbeatTest(unittest.TestCase):
     def setUp(self):
         ingest_pause.STATE.reset()
         self.addCleanup(ingest_pause.STATE.reset)
+        origin_pin.reset(); self.addCleanup(origin_pin.reset)
         self.t = [1000.0]
         self.stats = {"processed": 0, "photos": 0, "errors": 0}
         self.dir = os.environ.get("TMP") or "."
@@ -136,12 +138,21 @@ class HeartbeatTest(unittest.TestCase):
                 if tick.called:
                     break
                 h._stop.wait(0.01)
-            h.stop()
+            h.stop(); h._thread.join(5)
         self.assertTrue(tick.called)
+        self.assertFalse(h._thread.is_alive())
 
 
 
 class WiringTest(unittest.TestCase):
+    def setUp(self):
+        ingest_pause.STATE.reset(); self.addCleanup(ingest_pause.STATE.reset)
+        origin_pin.reset(); self.addCleanup(origin_pin.reset)
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
+        import foody_push  # load_creds would read a real creds.env into os.environ: keep it out of the tests
+        p = mock.patch.object(foody_push, "load_creds"); p.start(); self.addCleanup(p.stop)
+        env = mock.patch.dict(os.environ, {}); env.start(); self.addCleanup(env.stop)
+
     def test_foody_fetch_builds_the_heartbeat_from_pusher_stats(self):
         sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
         import foody_fetch

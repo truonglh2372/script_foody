@@ -4,7 +4,7 @@ No network: the HTTP session, the tokens and the sleep are fakes.
 
 Run: python3 tests/test_ingest_pause.py
 """
-import io, json, os, sys, unittest
+import io, json, os, sys, time, types, unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +41,7 @@ class FakeSession:
 
 class PauseTestBase(unittest.TestCase):
     def setUp(self):
+        self.real_sleep = time.sleep
         self.sleeps = []
         self.clock = [1000.0]
         ingest_pause.STATE.reset()
@@ -48,7 +49,10 @@ class PauseTestBase(unittest.TestCase):
         for target, value in (("_sleep", lambda s: (self.sleeps.append(s), self.clock.__setitem__(0, self.clock[0] + s))),
                               ("_now", lambda: self.clock[0])):
             p = mock.patch.object(ingest_pause, target, value); p.start(); self.addCleanup(p.stop)
-        p = mock.patch.object(aqd_api.time, "sleep", lambda s: self.sleeps.append(("backoff", s))); p.start(); self.addCleanup(p.stop)
+        # replace aqd_api's own `time` name, NOT the shared time module: other threads keep the real time.sleep
+        fake_time = types.SimpleNamespace(sleep=lambda s: self.sleeps.append(("backoff", s)), time=time.time)
+        p = mock.patch.object(aqd_api, "time", fake_time); p.start(); self.addCleanup(p.stop)
+        self.assertIs(self.real_sleep, time.sleep, "must not patch the process-wide time.sleep")
         self.client = aqd_api.AQD(base="https://aqd.test")
         self.client.tokens.access = lambda force=False: "tok"
 
