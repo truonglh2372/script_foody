@@ -43,10 +43,11 @@ Dừng: tạo file `foody_data/STOP`. Log: `foody_data/fetch.log`.
 
 ## Báo cáo Slack trực tiếp (an_uong_quanh_day#1388)
 `common/slack_notify.py` gửi thẳng lên **một kênh Slack chung** qua Incoming Webhook (không qua server; heartbeat `/v1/ingest/heartbeats` đã bỏ):
-- **Mỗi 4 giờ** (`AQD_REPORT_EVERY_H`): trạng thái 🟢 chạy / 🟡 kẹt / 🔴 lỗi / ⚫ dừng, vị trí (`foody page 533, parity even`), số liệu 4 giờ qua (quán, ảnh, review, upload ok/fail), lần thành công cuối, lỗi gần nhất + việc cần làm, giờ gửi báo cáo (UTC+7).
+- **Mỗi 4 giờ** (`AQD_REPORT_EVERY_H`): trạng thái 🟢 chạy / 🟡 kẹt / 🔴 lỗi / ⚫ dừng, vị trí (`foody page 533, parity even`), số liệu 4 giờ qua (quán, ảnh, review, upload ok/fail), lần thành công cuối (item mới cuối · trang list thành công cuối), lỗi gần nhất + việc cần làm, giờ gửi báo cáo (UTC+7).
 - **Bắt đầu / dừng** bình thường (file STOP, hết `--limit`, Ctrl+C).
 - **Cảnh báo ngay** (🔴, nhắc `SLACK_ALERT_MENTION`): `crash` (exception thoát process), `disk_low` (ổ < `AQD_DISK_MIN_GB`, mặc định 5 GB), `foody_empty_pages` (`AQD_EMPTY_PAGES_ALERT`=10 trang list liên tiếp bị bỏ vì trống), `captcha`, `signin_required`.
-- **Kẹt**: process vẫn chạy nhưng 0 quán/ảnh/review mới trong `AQD_STUCK_HOURS` (mặc định 3) giờ → 🟡.
+- **Kẹt**: process vẫn chạy nhưng trong `AQD_STUCK_HOURS` (mặc định 3) giờ không có quán/ảnh/review mới **và** không có trang list nào thành công (`page_ok`) → 🟡. Quét lại tỉnh đã lấy hết (trang vẫn chạy, 0 quán mới) không còn bị coi là kẹt (script_foody#30); chuỗi 503 / trang rỗng kéo dài vẫn cảnh báo như cũ.
+- **Quét xong, không có quán mới** (🔵, mức thấp): trang list vẫn chạy nhưng 0 item mới quá `AQD_IDLE_NOTICE_HOURS` (mặc định 24) giờ → gửi **1 lần**; chỉ gửi lại sau khi đã có item mới.
 - **Chống spam**: tối đa 1 cảnh báo / crawler / máy / mã lỗi / `AQD_ALERT_EVERY_H` (4) giờ, lưu ở `foody_data/slack_state.json` (giữ qua khởi động lại).
 - Gửi lỗi (mạng, timeout, HTTP) chỉ ghi 1 dòng log `[slack] gửi Slack lỗi: <loại lỗi>` (không có URL) và **không làm dừng crawler**.
 

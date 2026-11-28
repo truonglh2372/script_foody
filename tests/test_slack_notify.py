@@ -188,6 +188,152 @@ class Status(Base):
         self.assertEqual(n.status(n._load())[0], "🟢")
 
 
+class SweepFinished(Base):
+    def sweep(self, n, hours, step=600):
+        end = self.clock.t + hours * 3600
+        while self.clock.t < end:
+            self.clock.t = min(end, self.clock.t + step)
+            n.page_ok()
+            n.tick()
+
+    def test_pages_advancing_without_new_items_is_not_stuck(self):
+        n = self.notifier()
+        n.start()
+        self.sweep(n, 6)
+        self.assertEqual(n.status(n._load())[0], "🟢")
+        self.assertFalse(n.check_stuck())
+        self.assertFalse(any("KẸT" in x for x in self.out))
+        self.assertNotIn("stuck_since", n._load())
+
+    def test_no_page_progress_for_3h_is_stuck(self):
+        n = self.notifier()
+        n.start()
+        self.sweep(n, 1)
+        last_page = self.clock.t
+        self.clock.t = last_page + 3 * 3600 - 60
+        self.assertFalse(n.check_stuck())
+        self.clock.t = last_page + 3 * 3600
+        self.assertEqual(n.status(n._load())[0], "🟡")
+        self.assertTrue(n.check_stuck())
+        self.assertIn("KẸT: 3 giờ không có quán/review mới", self.out[-1])
+        self.assertIn("0 item mới từ 10:00 (UTC+7), trang list cuối 02/11 10:00 (UTC+7)", self.out[-1])
+        self.assertEqual(n._load()["stuck_since"], last_page)
+        n.page_ok()
+        self.assertEqual(n.status(n._load())[0], "🟢")
+        self.assertNotIn("stuck_since", n._load())
+
+    def test_long_sweep_sends_exactly_one_idle_notice(self):
+        n = self.notifier()
+        n.start()
+        self.sweep(n, 23.5)
+        self.assertFalse(any(x.startswith("🔵") for x in self.out))
+        self.sweep(n, 30)
+        idle = [x for x in self.out if x.startswith("🔵")]
+        self.assertEqual(len(idle), 1)
+        self.assertTrue(idle[0].startswith("🔵 *foody @ Admin* — quét xong, không có quán mới"), idle[0])
+        self.assertIn("0 item mới từ 02/11 09:00 (UTC+7, 24h00)", idle[0])
+        self.assertFalse(any("KẸT" in x for x in self.out))
+        self.assertTrue(all(x.startswith("🟢") for x in self.out if "giờ qua" in x))
+
+    def test_idle_notice_resets_after_new_items(self):
+        n = self.notifier()
+        n.start()
+        self.sweep(n, 25)
+        n.record_place(True, photos=2)
+        self.assertNotIn("idle_notice", n._load())
+        self.sweep(n, 23)
+        self.assertEqual(len([x for x in self.out if x.startswith("🔵")]), 1)
+        self.sweep(n, 2)
+        self.assertEqual(len([x for x in self.out if x.startswith("🔵")]), 2)
+
+    def test_idle_notice_survives_restart(self):
+        n = self.notifier()
+        n.start()
+        self.sweep(n, 25)
+        again = self.notifier()
+        again.start()
+        self.sweep(again, 25)
+        self.assertEqual(len([x for x in self.out if x.startswith("🔵")]), 1)
+
+    def test_no_idle_notice_without_page_progress(self):
+        n = self.notifier()
+        n.start()
+        for _ in range(30):
+            self.clock.t += 3600
+            n.tick()
+        self.assertFalse(any(x.startswith("🔵") for x in self.out))
+        self.assertTrue(any("KẸT" in x for x in self.out))
+
+    def test_report_shows_last_new_item_and_last_page(self):
+        n = self.notifier()
+        n.start()
+        self.clock.t = T0 + 1800
+        n.record_place(True)
+        self.clock.t = T0 + 3 * 3600
+        n.page_ok()
+        self.clock.t = T0 + 4 * 3600
+        n.report()
+        self.assertIn("• Thành công cuối: item mới 02/11 09:30 (UTC+7) · trang list 02/11 12:00 (UTC+7)\n",
+                      self.out[-1])
+
+    def test_report_without_any_success(self):
+        n = self.notifier()
+        n.report()
+        self.assertIn("• Thành công cuối: item mới chưa có · trang list chưa có\n", self.out[-1])
+
+
+class RealBlocks(Base):
+    def test_long_503_run_is_stuck(self):
+        n = self.notifier()
+        n.start()
+        n.page_ok()
+        for _ in range(3 * 60 // 5):
+            self.clock.t += 300
+            self.assertFalse(n.error("http_503", "Foody 503 busy, chờ 600s"))
+            n.tick()
+        stuck = [x for x in self.out if "KẸT" in x]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("• Lỗi gần nhất: `http_503`", stuck[0])
+        self.assertEqual(n.status(n._load())[0], "🟡")
+
+    def test_transient_503_while_pages_advance_is_not_stuck(self):
+        n = self.notifier()
+        n.start()
+        for _ in range(5 * 6):
+            self.clock.t += 600
+            n.error("http_503", "Foody 503 busy, chờ 30s")
+            n.page_ok()
+            n.tick()
+        self.assertFalse(any("KẸT" in x for x in self.out))
+
+    def test_empty_pages_still_alert_and_go_stuck(self):
+        n = self.notifier()
+        n.start()
+        n.page_ok()
+        for p in range(531, 541):
+            self.clock.t += 60
+            n.empty_page(str(p))
+        red = [x for x in self.out if x.startswith("🔴")]
+        self.assertEqual(len(red), 1)
+        self.assertIn("10 trang list liên tiếp trả \"0 quán\" (531→540)", red[0])
+        self.assertEqual(n.status(n._load())[0], "🔴")
+        self.clock.t = T0 + 3 * 3600
+        n.tick()
+        self.assertTrue(any("KẸT" in x for x in self.out))
+        self.assertFalse(any(x.startswith("🔵") for x in self.out))
+
+    def test_page_ok_after_empty_alert_clears_red(self):
+        n = self.notifier()
+        n.start()
+        for p in range(10):
+            self.clock.t += 60
+            n.empty_page(str(p))
+        self.assertEqual(n.status(n._load())[0], "🔴")
+        self.clock.t += 60
+        n.page_ok()
+        self.assertEqual(n.status(n._load())[0], "🟢")
+
+
 class Window(Base):
     def test_four_hour_window_and_reset(self):
         n = self.notifier()
